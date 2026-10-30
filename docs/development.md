@@ -59,6 +59,8 @@ Run `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` before p
 | `npm run test:main` | Check desktop security and pipeline regressions |
 | `npm run test:zernio` | Check social account, upload and posting flows against local mocks |
 | `npm run dist:mac` | Package the current Mac architecture into `dist/` after preparing matching resources (signing needs a Developer ID) |
+| `bash scripts/install-local-mac.sh` | Build this checkout into an unsigned app and swap it into `/Applications` to try changes on your own Mac (keeps a zip of the previous app in `~/Downloads`) |
+| `engine/.venv/bin/python scripts/banner-icons.py` | Redraw the channel-banner platform icons in `engine/assets/icons/` |
 | `npm run icons` | Export app icons from the imagegen master `resources/bridgeclip-icon.png` (macOS; see the [icon guide](../scripts/icon/README.md)) |
 
 ## Project layout
