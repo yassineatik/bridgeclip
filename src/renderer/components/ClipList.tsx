@@ -3,7 +3,7 @@ import { parseJobOutput } from '../../shared/job-output'
 import { editorProgress } from '../../shared/clip-editor'
 import { ClipEditor } from './ClipEditor'
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
-import { ArrowLeft, Check, ChevronDown, Clapperboard, Download, FolderOpen, ListPlus, Plus, Scissors, Search, Send, Trash2, Youtube } from 'lucide-react'
+import { ArrowLeft, Check, ChevronDown, Clapperboard, Download, FolderOpen, ListPlus, Plus, RotateCcw, Scissors, Search, Send, Trash2, Youtube } from 'lucide-react'
 import { basename, cn, errorMessage } from '../lib/utils'
 import { getApi } from '../lib/ipc'
 import { clipFilePath } from '../lib/thumbnails'
@@ -27,6 +27,7 @@ import { Callout } from './ui/Callout'
 import { Segmented } from './ui/Segmented'
 import { usePostsStore } from '../store/use-posts-store'
 import { useSettingsStore } from '../store/use-settings-store'
+import { useDraftStore } from '../store/use-draft-store'
 import type { LibraryClipPostingStatus } from '../../shared/library-posting'
 import type { Page as AppPage } from './Sidebar'
 
@@ -328,6 +329,24 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
             {outputDir && (
               <Button icon={<FolderOpen className="h-3.5 w-3.5" />} onClick={() => getApi().shell.openPath(outputDir)}>
                 Open folder
+              </Button>
+            )}
+            {onNavigate && !output.editor_project && outputDir && (
+              <Button
+                icon={<RotateCcw className="h-3.5 w-3.5" />}
+                disabled={!output.source_video_url}
+                title={output.source_video_url ? 'Render a few of this run\'s clips again with new settings, for free' : 'This run does not record its source video'}
+                onClick={() => {
+                  useDraftStore.getState().startRerender({
+                    jobId: outputDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '',
+                    title: output.source_video_title,
+                    clipCount: output.total_clips || output.clips.length,
+                    source: output.source_video_url
+                  })
+                  onNavigate('clip')
+                }}
+              >
+                Render again
               </Button>
             )}
             {onNewClip && (

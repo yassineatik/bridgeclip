@@ -7,7 +7,7 @@ const { renderToStaticMarkup } = require('react-dom/server')
 
 const bundled = buildSync({
   stdin: {
-    contents: `export { FormatStep, ClipsStep, CaptionsStep, JobForm, buildJobRequest, parseTrimRange } from './src/renderer/components/JobForm';
+    contents: `export { FormatStep, ClipsStep, CaptionsStep, JobForm, RerenderNotice, buildJobRequest, parseTrimRange, rerenderLabel } from './src/renderer/components/JobForm';
       export { JobProgress } from './src/renderer/components/JobProgress';
       export { SetupCard } from './src/renderer/components/SetupCard';
       export { useSettingsStore } from './src/renderer/store/use-settings-store';
@@ -107,6 +107,94 @@ test('clipping mode is selectable and economy disables paid vision in the submit
   assert.equal(Object.hasOwn(request, 'debugCapture'), false)
   assert.equal(request.layoutVision, false)
   assert.equal(buildJobRequest({ ...draft, clippingMode: 'quality' }, { start: null, end: null }).layoutVision, true)
+})
+
+test('the channel banner takes one handle and the platforms whose icons precede it', () => {
+  const { CaptionsStep, useDraftStore, buildJobRequest } = form.exports
+  const original = useDraftStore.getState()
+  try {
+    original.update({ workflow: 'automatic', source: 'https://example.com/video' })
+    const blank = renderToStaticMarkup(React.createElement(CaptionsStep, { draft: useDraftStore.getState(), update() {} }))
+    assert.match(blank, /Channel banner/)
+    assert.match(blank, /aria-label="Channel handle"[^>]*placeholder="@YassInPublic"|placeholder="@YassInPublic"[^>]*aria-label="Channel handle"/)
+    const boxes = blank.match(/<button[^>]*role="checkbox"[^>]*>/g) ?? []
+    assert.equal(boxes.length, 4)
+    const positions = [...blank.matchAll(/aria-label="Banner position"[^>]*>(.*?)<p id="banner-position-help"/gs)][0]?.[1] ?? ''
+    for (const label of ['Auto', 'Mixed']) assert.match(positions, new RegExp(label))
+    for (const label of ['Top left', 'Middle center', 'Bottom right']) assert.match(positions, new RegExp(`aria-label="${label}"`))
+    assert.equal((positions.match(/role="radio"/g) ?? []).length, 11)
+    assert.ok((positions.match(/<button[^>]*role="radio"[^>]*>/g) ?? []).every((radio) => radio.includes('disabled')), 'position waits for a handle')
+    assert.equal((positions.match(/tabindex="0"/g) ?? []).length, 1, 'one tab stop in the position group')
+    for (const label of ['YouTube', 'X', 'TikTok', 'Instagram']) assert.ok(boxes.some((box) => box.includes(`aria-label="${label}"`)), label)
+    assert.ok(boxes.every((box) => box.includes('disabled')), 'platforms wait for a handle')
+    let request = buildJobRequest(useDraftStore.getState(), { start: null, end: null })
+    assert.deepEqual([request.bannerHandle, request.bannerPlatforms], [null, []])
+    assert.equal(Object.hasOwn(request, 'bannerPosition'), false)
+
+    original.update({ bannerHandle: 'YassInPublic', bannerPlatforms: ['instagram', 'youtube'] })
+    const filled = renderToStaticMarkup(React.createElement(CaptionsStep, { draft: useDraftStore.getState(), update() {} }))
+    assert.equal((filled.match(/role="checkbox"[^>]*aria-checked="true"/g) ?? []).length, 2)
+    assert.doesNotMatch(filled, /role="alert"/)
+    request = buildJobRequest(useDraftStore.getState(), { start: null, end: null })
+    assert.deepEqual([request.bannerHandle, request.bannerPlatforms], ['@YassInPublic', ['youtube', 'instagram']])
+    assert.equal(request.bannerPosition, 'auto')
+    original.update({ bannerPosition: 'mixed' })
+    assert.equal(buildJobRequest(useDraftStore.getState(), { start: null, end: null }).bannerPosition, 'mixed')
+    assert.match(renderToStaticMarkup(React.createElement(CaptionsStep, { draft: useDraftStore.getState(), update() {} })), /aria-checked="true"[^>]*>(?:(?!<\/button>).)*Mixed/s)
+    original.update({ bannerPosition: 'bottom-left' })
+    assert.equal(buildJobRequest(useDraftStore.getState(), { start: null, end: null }).bannerPosition, 'bottom-left')
+    const grid = renderToStaticMarkup(React.createElement(CaptionsStep, { draft: useDraftStore.getState(), update() {} }))
+    assert.match(grid, /aria-label="Bottom left"[^>]*aria-checked="true"|aria-checked="true"[^>]*aria-label="Bottom left"/)
+    assert.match(grid, /id="banner-position-help"[^>]*>Bottom left\./)
+
+    original.update({ bannerHandle: 'yass in public' })
+    assert.match(renderToStaticMarkup(React.createElement(CaptionsStep, { draft: useDraftStore.getState(), update() {} })), /role="alert"[^>]*>Use letters, numbers, dots, underscores or dashes\./)
+    // The banner is an output preference: it survives starting the next video.
+    original.update({ bannerHandle: '@YassInPublic' })
+    original.startAnother()
+    assert.deepEqual([useDraftStore.getState().bannerHandle, useDraftStore.getState().bannerPlatforms], ['@YassInPublic', ['instagram', 'youtube']])
+  } finally { useDraftStore.setState(original) }
+})
+
+test('render again reuses a finished run, starts on Format with three clips and sends no planning options', () => {
+  const { ClipsStep, FormatStep, RerenderNotice, useDraftStore, buildJobRequest, rerenderLabel } = form.exports
+  const original = useDraftStore.getState()
+  try {
+    original.update({ clipRequest: 'pricing', trimOpen: true, trimStart: '10', trimEnd: '70', layoutVision: true })
+    original.startRerender({ jobId: '9e15acb6-5643-457f-80ed-e9ef4dedce57', title: 'Day 1', clipCount: 34, source: '/Users/me/Videos/day1.mp4' })
+    const draft = useDraftStore.getState()
+    assert.equal(draft.step, 'format')
+    assert.equal(draft.workflow, 'automatic')
+    assert.deepEqual([draft.autoClipCount, draft.maxClips, draft.clipRequest, draft.trimOpen], [false, 3, '', false])
+    const request = buildJobRequest(draft, { start: 10, end: 70 })
+    assert.equal(request.rerenderFrom, '9e15acb6-5643-457f-80ed-e9ef4dedce57')
+    assert.deepEqual([request.workflow, request.maxClips, request.durationRanges, request.startTimeSeconds, request.endTimeSeconds, request.layoutVision], ['automatic', 3, null, null, null, false])
+    assert.equal(Object.hasOwn(request, 'clipRequest'), false)
+    const clips = renderToStaticMarkup(React.createElement(ClipsStep, { draft, update() {} }))
+    assert.doesNotMatch(clips, /What to clip/)
+    assert.match(clips, /Render every planned clip/)
+    assert.match(clips, /first 3 clips of the saved plan/)
+    // The counter never exceeds the saved plan, and "all" means every planned clip.
+    original.update({ maxClips: 99 })
+    assert.equal(buildJobRequest(useDraftStore.getState(), { start: null, end: null }).maxClips, 34)
+    original.update({ autoClipCount: true })
+    assert.equal(buildJobRequest(useDraftStore.getState(), { start: null, end: null }).maxClips, null)
+    assert.equal(rerenderLabel(useDraftStore.getState()), 'Render 34 clips')
+    assert.equal(rerenderLabel({ ...useDraftStore.getState(), autoClipCount: false, maxClips: 1 }), 'Render 1 clip')
+    // (JobForm itself reads the store's initial state under server rendering, so its parts are checked directly.)
+    const notice = renderToStaticMarkup(React.createElement(RerenderNotice, { run: useDraftStore.getState().rerenderFrom, onStartOver() {} }))
+    assert.match(notice, /Render again/)
+    assert.match(notice, /Day 1/)
+    assert.match(notice, /34 planned clips/)
+    assert.match(notice, /Start over with a new video/)
+    const format = renderToStaticMarkup(React.createElement(FormatStep, { draft: useDraftStore.getState(), update() {} }))
+    assert.doesNotMatch(format, /AI vision for smart framing/)
+    assert.match(format, /AI vision checks are off when rendering a run again/)
+    // Starting over clears the re-render and asks for a workflow again.
+    original.startAnother()
+    assert.equal(useDraftStore.getState().rerenderFrom, null)
+    assert.equal(useDraftStore.getState().workflow, null)
+  } finally { useDraftStore.setState(original) }
 })
 
 test('the title card is shown by default and can be turned off for automatic runs', () => {

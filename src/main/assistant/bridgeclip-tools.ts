@@ -228,8 +228,8 @@ export function clipJobRequestFromInput(input: Record<string, unknown>): ClipJob
     includeTitle: input.titleCard !== false,
     startTimeSeconds: (input.startSeconds as number | undefined) ?? null,
     endTimeSeconds: (input.endSeconds as number | undefined) ?? null,
-    bannerPlatform: null,
-    bannerChannelUrl: null
+    bannerHandle: null,
+    bannerPlatforms: []
   }
 }
 

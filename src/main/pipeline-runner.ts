@@ -463,7 +463,8 @@ export function startClipJob(
     duration_ranges: config.durationRanges,
     aspect_ratio: config.aspectRatio,
     layout_style: config.layoutStyle || 'auto',
-    layout_vision_enabled: config.clippingMode === 'economy' ? false : config.layoutVision,
+    // Re-renders are for trying changes: never pay for vision checks on them.
+    layout_vision_enabled: config.clippingMode === 'economy' || config.rerenderFrom !== undefined ? false : config.layoutVision,
     pacing: config.pacing || 'tight',
     video_speed: config.videoSpeed ?? 1,
     include_captions: config.includeCaptions,
@@ -472,8 +473,10 @@ export function startClipJob(
     keyterms: vocabularyTerms(settings.customVocabulary),
     start_time_seconds: config.startTimeSeconds,
     end_time_seconds: config.endTimeSeconds,
-    banner_platform: config.bannerPlatform,
-    banner_channel_url: config.bannerChannelUrl,
+    banner_handle: config.bannerHandle,
+    banner_platforms: config.bannerPlatforms,
+    banner_position: config.bannerPosition ?? 'auto',
+    ...(config.rerenderFrom !== undefined ? { rerender_from: config.rerenderFrom } : {}),
     output_dir: settings.outputDirectory
   })
 

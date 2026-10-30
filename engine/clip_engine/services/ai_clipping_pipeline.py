@@ -20,13 +20,13 @@ import shutil
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 from enum import Enum
 from typing import Any, Callable, Optional
 
 from clip_engine.config import CaptionStyle, LayoutStyle, get_settings, is_longform, resolve_clip_duration_bounds
 from clip_engine.services.video_speed import validate_video_speed
-from clip_engine.error_policy import NoClipCandidatesError, NoRequestedMomentsError, safe_failure_code, safe_processing_error
+from clip_engine.error_policy import NoClipCandidatesError, NoRequestedMomentsError, RerenderSourceError, safe_failure_code, safe_processing_error
 from clip_engine.services.source_context import SourceContextService, context_for_prompt, transcription_terms
 from clip_engine.services.editorial_evidence import discovery_feedback, overlaps
 from clip_engine.services.jev_service import JevService, MODEL as JEV_MODEL
@@ -40,6 +40,7 @@ from clip_engine.services.intelligence_planner import (
     ClipPlanSegment,
     IntelligencePlannerService,
 )
+from clip_engine.services.layout_renderer import BANNER_MIXED_CYCLE, is_banner_position
 from clip_engine.services.memory_monitor import (
     force_gc,
     log_memory_usage,
@@ -59,6 +60,8 @@ from clip_engine.services.transcription_service import (
     NoAudioTrackError,
     TranscriptionResult,
     TranscriptionService,
+    TranscriptSegment,
+    TranscriptWord,
 )
 from clip_engine.services.visual_clip_sampling import has_visual_change, sample_visual_planning_frames
 from clip_engine.services.video_downloader import (
@@ -110,8 +113,16 @@ class ClippingJobRequest:
     callback_url: Optional[str] = None
     start_time_seconds: Optional[float] = None
     end_time_seconds: Optional[float] = None
-    banner_platform: Optional[str] = None
-    banner_channel_url: Optional[str] = None
+    # Channel banner on every clip: the creator's handle after the icons of
+    # these platforms ("youtube", "x", "tiktok", "instagram"). No handle, no banner.
+    banner_handle: Optional[str] = None
+    banner_platforms: list[str] = field(default_factory=list)
+    # "auto", "mixed" (a different spot on each clip) or "<top|middle|bottom>-<left|center|right>".
+    banner_position: str = "auto"
+    # Render again: the id (folder name) of a finished local run whose saved
+    # transcript.json and plan.json replace research, transcription, planning
+    # and review. max_clips then keeps the first clips of that plan.
+    rerender_from: Optional[str] = None
     aspect_ratio: str = "9:16"
     keyterms: Optional[list[str]] = None
     # The user's description of the moments to clip; None picks the best moments.
@@ -132,6 +143,23 @@ class ClippingJobRequest:
             self.job_id = str(uuid.uuid4())
         if not isinstance(self.job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.job_id):
             raise ValueError("Invalid job ID")
+        if not is_banner_position(self.banner_position):
+            raise ValueError("Invalid banner position")
+        if self.rerender_from is not None and (
+            not isinstance(self.rerender_from, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.rerender_from)
+        ):
+            raise ValueError("Invalid run to render again")
+
+
+@dataclass
+class RerenderSources:
+    """What a finished run keeps that a re-render reuses."""
+
+    transcription: TranscriptionResult
+    status: str
+    plan: ClipPlanResponse
+    planning_source: str
+    planned_clips: int
 
 
 @dataclass
@@ -208,7 +236,7 @@ class AIClippingPipeline:
         loop = asyncio.get_running_loop()
         start_time = time.time()
         job_id = request.job_id
-        jev_enabled = request.workflow == 'review' or getattr(self.settings, 'jev_enabled', False)
+        jev_enabled = (request.workflow == 'review' or getattr(self.settings, 'jev_enabled', False)) and not request.rerender_from
         editorial_service = JevService.from_settings(self.settings, required=request.workflow == 'review')
         coherence_service = JevService(self.settings.openrouter_api_key if jev_enabled else '', max_requests=256, token_budget=1536000)
         work_dir = os.path.join(self.settings.temp_directory, job_id)
@@ -246,6 +274,10 @@ class AIClippingPipeline:
         try:
             os.makedirs(work_dir, mode=0o700, exist_ok=True)
             logger.info(f"Starting AI clipping job: {job_id}")
+            # Render again: a finished run's transcript and plan stand in for
+            # research, transcription, planning and review. Fails before any
+            # download when the run has nothing to reuse.
+            rerender = self._load_rerender(request.rerender_from) if request.rerender_from else None
             logger.info("Video source received")
             logger.info(f"Max clips: {request.max_clips}, Duration ranges: {request.duration_ranges}")
             logger.info(
@@ -293,7 +325,7 @@ class AIClippingPipeline:
             # speech. It is part of Jev review and of opt-in web research; with
             # both off, automatic clipping plans from the transcript alone.
             source_context = None
-            if jev_enabled or getattr(self.settings, 'source_context_web_research', False):
+            if rerender is None and (jev_enabled or getattr(self.settings, 'source_context_web_research', False)):
                 current_stage = "source_context"
                 self._update_progress(job_id, JobStatus.CONTEXTUALIZING, 12, "Researching the source and building context...")
                 stage_start = time.perf_counter()
@@ -304,43 +336,49 @@ class AIClippingPipeline:
             context_brief = context_for_prompt(source_context)
             source_context_cost = source_context['cost_usd'] if source_context else 0.0
 
-            # Step 2: Transcribe audio. Jev reviews setup and payoff anywhere in
-            # the source, so it needs all of it; otherwise only the chosen range.
-            current_stage = "transcription"
-            self._update_progress(
-                job_id, JobStatus.TRANSCRIBING, 15,
-                "Transcribing the full source for context..." if jev_enabled else "Transcribing audio...",
-            )
-            stage_start = time.perf_counter()
-            previous_transcription_progress = getattr(self.transcription_service, "progress_callback", None)
-            self.transcription_service.progress_callback = lambda message: self._update_progress(
-                job_id, JobStatus.TRANSCRIBING, 15, message,
-            )
-            self.transcription_service.detail_callback = lambda done, total: self._update_progress(
-                job_id, JobStatus.TRANSCRIBING, 15 + 10 * done / total, f'Transcribing audio, part {done + 1} of {total}…',
-                stage_id='transcription', stage_percent=100 * done / total, completed=done, total=total, unit='chunks')
-            try:
-                transcription_result = await self.transcription_service.transcribe(
-                    video_path=download_result.video_path,
-                    work_dir=work_dir,
-                    keyterms=transcription_terms(request.keyterms, source_context) if source_context else request.keyterms,
-                    start_seconds=None if jev_enabled else request.start_time_seconds,
-                    end_seconds=None if jev_enabled else effective_end_time,
-                )
-            except NoAudioTrackError:
-                logger.info("Source has no audio track; trying visual-only planning")
-                transcription_result = TranscriptionResult(segments=[], full_text="", provider="no_audio")
-                transcription_status = "no_speech"
+            if rerender is not None:
+                # Render again: the saved transcript replaces the paid stage.
+                transcription_result, transcription_status = rerender.transcription, rerender.status
+                self._update_progress(job_id, JobStatus.TRANSCRIBING, 25, 'Reusing the saved transcript...')
+                stage_timings['transcription'] = 0.0
             else:
-                if not transcription_result.segments:
+                # Step 2: Transcribe audio. Jev reviews setup and payoff anywhere in
+                # the source, so it needs all of it; otherwise only the chosen range.
+                current_stage = "transcription"
+                self._update_progress(
+                    job_id, JobStatus.TRANSCRIBING, 15,
+                    "Transcribing the full source for context..." if jev_enabled else "Transcribing audio...",
+                )
+                stage_start = time.perf_counter()
+                previous_transcription_progress = getattr(self.transcription_service, "progress_callback", None)
+                self.transcription_service.progress_callback = lambda message: self._update_progress(
+                    job_id, JobStatus.TRANSCRIBING, 15, message,
+                )
+                self.transcription_service.detail_callback = lambda done, total: self._update_progress(
+                    job_id, JobStatus.TRANSCRIBING, 15 + 10 * done / total, f'Transcribing audio, part {done + 1} of {total}…',
+                    stage_id='transcription', stage_percent=100 * done / total, completed=done, total=total, unit='chunks')
+                try:
+                    transcription_result = await self.transcription_service.transcribe(
+                        video_path=download_result.video_path,
+                        work_dir=work_dir,
+                        keyterms=transcription_terms(request.keyterms, source_context) if source_context else request.keyterms,
+                        start_seconds=None if jev_enabled else request.start_time_seconds,
+                        end_seconds=None if jev_enabled else effective_end_time,
+                    )
+                except NoAudioTrackError:
+                    logger.info("Source has no audio track; trying visual-only planning")
+                    transcription_result = TranscriptionResult(segments=[], full_text="", provider="no_audio")
                     transcription_status = "no_speech"
-            finally:
-                self.transcription_service.progress_callback = previous_transcription_progress
-                self.transcription_service.detail_callback = None
-            stage_timings["transcription"] = time.perf_counter() - stage_start
-            logger.info(f"Transcription complete: {len(transcription_result.segments)} segments")
+                else:
+                    if not transcription_result.segments:
+                        transcription_status = "no_speech"
+                finally:
+                    self.transcription_service.progress_callback = previous_transcription_progress
+                    self.transcription_service.detail_callback = None
+                stage_timings["transcription"] = time.perf_counter() - stage_start
+                logger.info(f"Transcription complete: {len(transcription_result.segments)} segments")
 
-            if transcription_status != "available":
+            if transcription_status != "available" and rerender is None:
                 self._update_progress(job_id, JobStatus.PLANNING, 25, "Analyzing video frames...")
                 stage_start = time.perf_counter()
                 visual_frames = await sample_visual_planning_frames(
@@ -378,13 +416,6 @@ class AIClippingPipeline:
 
             capture_memory("after_transcription")
 
-            # Step 3: Plan clips using AI
-            current_stage = "planning"
-            self._update_progress(
-                job_id, JobStatus.PLANNING, 30,
-                "Finding complete ideas near your preferred range..." if jev_enabled else "Planning viral clips...",
-            )
-            stage_start = time.perf_counter()
             edit_audit = {'version': 1, 'title': download_result.metadata.title,
                 'source_context': source_context,
                 'duration_ms': round(video_duration * 1000),
@@ -396,158 +427,194 @@ class AIClippingPipeline:
                 if self.local_mode:
                     self._save_local_json(job_id, 'edit_audit', edit_audit)
             save_edit_audit()
-            planning_args = dict(
-                transcript_result=transcription_result,
-                video_metadata=download_result.metadata,
-                source_context=context_brief,
-                max_clips=request.max_clips,
-                auto_clip_count=request.auto_clip_count,
-                min_duration_seconds=request.min_clip_duration_seconds,
-                max_duration_seconds=request.max_clip_duration_seconds,
-                duration_ranges=request.duration_ranges,
-                target_platform=(
-                    "youtube" if request.aspect_ratio == "16:9" and request.target_platform == "tiktok"
-                    else request.target_platform
-                ),
-                frames=visual_frames,
-                start_time_seconds=request.start_time_seconds,
-                end_time_seconds=request.end_time_seconds,
-                aspect_ratio=request.aspect_ratio,
-                jev_enabled=jev_enabled,
-                clip_request=request.clip_request,
-            )
-            clip_plan = await self.intelligence_planner.plan_clips(**planning_args)
-            edit_audit['planner'] = getattr(self.intelligence_planner, 'audit', {'requests': []})
-            stage_timings["planning"] = time.perf_counter() - stage_start
-            logger.info(f"Planned {len(clip_plan.segments)} clips")
-            if not clip_plan.segments:
-                edit_audit['outcome'] = 'no_candidates'
-                raise NoRequestedMomentsError() if request.clip_request else NoClipCandidatesError()
-            reviewer = CoherenceReviewer(coherence_service, self.settings, transcription_result.segments, round(video_duration * 1000))
-            editorial_vision = EditorialVision(self.settings, download_result.video_path, work_dir, round(video_duration * 1000))
-            reviewer.source_context = context_brief
-            reviewer.visual_observer = editorial_vision.observe if getattr(self.settings, 'jev_visual_context', False) else None
-            if request.workflow == 'review':
-                if not self.local_mode:
-                    raise ValueError('Review projects require local mode')
-                from clip_engine.services.manual_editor import prepare_project
-                project = await prepare_project(request, clip_plan.segments, transcription_result.segments,
-                    download_result, self.rendering_service, reviewer, self._get_local_output_dir(job_id),
-                    lambda message, percent=None, stage='preparing': self._update_progress(job_id, JobStatus.PLANNING,
-                        {'preparing': 40, 'saving': 80, 'preview': 85}[stage] + (percent or 0) * {'preparing': .4, 'saving': .05, 'preview': .1}[stage], message,
-                        stage_id=stage, stage_percent=percent))
-                edit_audit['outcome'] = 'ready_for_review'
-                save_edit_audit()
-                costs = source_context_cost + coherence_service.estimated_cost_usd
-                for api in (transcription_result.api_costs, clip_plan.api_costs):
-                    costs += getattr(api, 'estimated_cost_usd', 0) if api else 0
-                output = JobOutput(job_id=job_id, source_video_url=request.video_url,
-                    source_video_title=download_result.metadata.title, source_video_duration_seconds=video_duration,
-                    source_video_description=(getattr(download_result.metadata, 'description', '') or '')[:20000],
-                    source_video_channel=getattr(download_result.metadata, 'uploader', None),
-                    total_clips=0, clips=[], editor_project=True, transcript_url=transcript_upload.s3_url,
-                    processing_time_seconds=time.time() - start_time,
-                    metrics={'planned_clip_count': len(project['candidates']),
-                        'api_costs': {'total_estimated_cost_usd': costs, 'cost_incomplete': True},
-                        'diagnostics': self._diagnostics.snapshot(),
-                        'pipeline_stages': self._stage_progress.update('completed')})
-                self._save_local_json(job_id, 'job_output', asdict(output))
-                self._update_progress(job_id, JobStatus.COMPLETED, 100, 'Ready to edit')
-                return ClippingJobResult(job_id=job_id, status=JobStatus.COMPLETED, output=output,
-                    processing_time_seconds=time.time() - start_time)
-            accepted = []
-            limit = getattr(self.intelligence_planner, 'discovery_limit', None) or request.max_clips or self.settings.max_clips_absolute
-            pending = clip_plan.segments
-            for discovery_pass in (1, 2):
-                for segment in pending:
-                    i = len(edit_audit['candidates'])
-                    self._update_progress(job_id, JobStatus.PLANNING, 35,
-                        f"Reviewing candidate {i + 1} for coherence (discovery {discovery_pass})..." if jev_enabled else f"Selecting planned clip {i + 1}...",
-                        stage_id="reviewing" if jev_enabled else "planning", stage_percent=None)
-                    # Reaction protection and boundary expansion belong to Jev
-                    # review; without it, planned clips render as planned.
-                    segment.editorial = (
-                        analyze_reactions(transcription_result.segments, segment.start_time_ms, segment.end_time_ms)
-                        if jev_enabled else empty_report()
-                    )
-                    entry = {'candidate_index': i, 'title': segment.summary or '', 'discovery_pass': discovery_pass,
-                        'original_interval': [segment.start_time_ms, segment.end_time_ms],
-                        'clip_index': None, 'status': 'reviewing', 'report': segment.editorial}
-                    edit_audit['candidates'].append(entry)
-                    if len(accepted) >= limit:
-                        entry['status'] = 'selection_limit'
-                        save_edit_audit()
-                        continue
-                    if jev_enabled:
-                        segment.start_time_ms, segment.end_time_ms = repair_context_boundaries(
-                            segment.start_time_ms, segment.end_time_ms, segment.editorial, 0, round(video_duration * 1000), round(video_duration * 1000))
-                    else:
-                        # Explicit opt-out bypasses review; provider failures never do.
-                        reviewer.trace(segment.editorial).update(status='skipped', reason='disabled_by_user',
-                            original_interval=entry['original_interval'])
-                    if not jev_enabled or await reviewer.prepare(segment, segment.editorial):
-                        entry['title'] = segment.summary or ''
-                        if any(overlaps([segment.start_time_ms, segment.end_time_ms], [c.start_time_ms, c.end_time_ms]) for c in accepted):
-                            entry['status'] = 'overlap_not_selected'
-                        else:
-                            entry['status'] = 'accepted'
-                            accepted.append(segment)
-                            if jev_enabled:
-                                await protect_acknowledgments(editorial_service, transcription_result.segments,
-                                                              segment.start_time_ms, segment.end_time_ms, segment.editorial)
-                    else:
-                        entry['status'] = 'rejected'
-                    save_edit_audit()
-                # One bounded search for overlooked moments, not repeated attempts to fill a quota.
-                if (not jev_enabled or discovery_pass == 2 or len(accepted) >= limit or not coherence_service.enabled
-                        or not any(c['status'] == 'rejected' for c in edit_audit['candidates'])
-                        or coherence_service.requests >= coherence_service.max_requests
-                        or coherence_service.reserved_tokens >= coherence_service.token_budget
-                        or not any((a.get('judgment') or {}).get('status') == 'success'
-                            for c in edit_audit['candidates'] for a in c['report'].get('coherence', {}).get('attempts', []))):
-                    break
-                feedback = discovery_feedback(edit_audit['candidates'], round(video_duration * 1000), edit_audit['preferred_range'])
-                edit_audit['discovery'] = {'status': 'searching' if feedback['search_intervals'] else 'exhausted', **feedback}
-                if not feedback['search_intervals']:
-                    break
-                try:
-                    extra = await self.intelligence_planner.plan_clips(**{**planning_args,
-                        'max_clips': min(8, limit - len(accepted)), 'auto_clip_count': False,
-                        'discovery_feedback': feedback})
-                    # Also enforce exclusions at the pipeline boundary, including mocked/custom planners.
-                    pending = [c for c in extra.segments[:8]
-                        if any(overlaps([c.start_time_ms, c.end_time_ms], span) for span in feedback['search_intervals'])
-                        and not any(overlaps([c.start_time_ms, c.end_time_ms], old['interval']) for old in feedback['previous_candidates'])]
-                    edit_audit['discovery']['status'] = 'completed'
-                    if extra.api_costs:
-                        if clip_plan.api_costs:
-                            for field in ('prompt_tokens', 'completion_tokens', 'total_tokens', 'estimated_cost_usd', 'attempts'):
-                                setattr(clip_plan.api_costs, field, getattr(clip_plan.api_costs, field) + getattr(extra.api_costs, field))
-                        else:
-                            clip_plan.api_costs = extra.api_costs
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # A failed optional search must not discard already approved clips.
-                    edit_audit['discovery']['status'] = 'unavailable'
-                    pending = []
+
+            if rerender is None:
+                # Step 3: Plan clips using AI
+                current_stage = "planning"
+                self._update_progress(
+                    job_id, JobStatus.PLANNING, 30,
+                    "Finding complete ideas near your preferred range..." if jev_enabled else "Planning viral clips...",
+                )
+                stage_start = time.perf_counter()
+                planning_args = dict(
+                    transcript_result=transcription_result,
+                    video_metadata=download_result.metadata,
+                    source_context=context_brief,
+                    max_clips=request.max_clips,
+                    auto_clip_count=request.auto_clip_count,
+                    min_duration_seconds=request.min_clip_duration_seconds,
+                    max_duration_seconds=request.max_clip_duration_seconds,
+                    duration_ranges=request.duration_ranges,
+                    target_platform=(
+                        "youtube" if request.aspect_ratio == "16:9" and request.target_platform == "tiktok"
+                        else request.target_platform
+                    ),
+                    frames=visual_frames,
+                    start_time_seconds=request.start_time_seconds,
+                    end_time_seconds=request.end_time_seconds,
+                    aspect_ratio=request.aspect_ratio,
+                    jev_enabled=jev_enabled,
+                    clip_request=request.clip_request,
+                )
+                clip_plan = await self.intelligence_planner.plan_clips(**planning_args)
                 edit_audit['planner'] = getattr(self.intelligence_planner, 'audit', {'requests': []})
+                stage_timings["planning"] = time.perf_counter() - stage_start
+                logger.info(f"Planned {len(clip_plan.segments)} clips")
+                if not clip_plan.segments:
+                    edit_audit['outcome'] = 'no_candidates'
+                    raise NoRequestedMomentsError() if request.clip_request else NoClipCandidatesError()
+                reviewer = CoherenceReviewer(coherence_service, self.settings, transcription_result.segments, round(video_duration * 1000))
+                editorial_vision = EditorialVision(self.settings, download_result.video_path, work_dir, round(video_duration * 1000))
+                reviewer.source_context = context_brief
+                reviewer.visual_observer = editorial_vision.observe if getattr(self.settings, 'jev_visual_context', False) else None
+                if request.workflow == 'review':
+                    if not self.local_mode:
+                        raise ValueError('Review projects require local mode')
+                    from clip_engine.services.manual_editor import prepare_project
+                    project = await prepare_project(request, clip_plan.segments, transcription_result.segments,
+                        download_result, self.rendering_service, reviewer, self._get_local_output_dir(job_id),
+                        lambda message, percent=None, stage='preparing': self._update_progress(job_id, JobStatus.PLANNING,
+                            {'preparing': 40, 'saving': 80, 'preview': 85}[stage] + (percent or 0) * {'preparing': .4, 'saving': .05, 'preview': .1}[stage], message,
+                            stage_id=stage, stage_percent=percent))
+                    edit_audit['outcome'] = 'ready_for_review'
+                    save_edit_audit()
+                    costs = source_context_cost + coherence_service.estimated_cost_usd
+                    for api in (transcription_result.api_costs, clip_plan.api_costs):
+                        costs += getattr(api, 'estimated_cost_usd', 0) if api else 0
+                    output = JobOutput(job_id=job_id, source_video_url=request.video_url,
+                        source_video_title=download_result.metadata.title, source_video_duration_seconds=video_duration,
+                        source_video_description=(getattr(download_result.metadata, 'description', '') or '')[:20000],
+                        source_video_channel=getattr(download_result.metadata, 'uploader', None),
+                        total_clips=0, clips=[], editor_project=True, transcript_url=transcript_upload.s3_url,
+                        processing_time_seconds=time.time() - start_time,
+                        metrics={'planned_clip_count': len(project['candidates']),
+                            'api_costs': {'total_estimated_cost_usd': costs, 'cost_incomplete': True},
+                            'diagnostics': self._diagnostics.snapshot(),
+                            'pipeline_stages': self._stage_progress.update('completed')})
+                    self._save_local_json(job_id, 'job_output', asdict(output))
+                    self._update_progress(job_id, JobStatus.COMPLETED, 100, 'Ready to edit')
+                    return ClippingJobResult(job_id=job_id, status=JobStatus.COMPLETED, output=output,
+                        processing_time_seconds=time.time() - start_time)
+                accepted = []
+                limit = getattr(self.intelligence_planner, 'discovery_limit', None) or request.max_clips or self.settings.max_clips_absolute
+                pending = clip_plan.segments
+                for discovery_pass in (1, 2):
+                    for segment in pending:
+                        i = len(edit_audit['candidates'])
+                        self._update_progress(job_id, JobStatus.PLANNING, 35,
+                            f"Reviewing candidate {i + 1} for coherence (discovery {discovery_pass})..." if jev_enabled else f"Selecting planned clip {i + 1}...",
+                            stage_id="reviewing" if jev_enabled else "planning", stage_percent=None)
+                        # Reaction protection and boundary expansion belong to Jev
+                        # review; without it, planned clips render as planned.
+                        segment.editorial = (
+                            analyze_reactions(transcription_result.segments, segment.start_time_ms, segment.end_time_ms)
+                            if jev_enabled else empty_report()
+                        )
+                        entry = {'candidate_index': i, 'title': segment.summary or '', 'discovery_pass': discovery_pass,
+                            'original_interval': [segment.start_time_ms, segment.end_time_ms],
+                            'clip_index': None, 'status': 'reviewing', 'report': segment.editorial}
+                        edit_audit['candidates'].append(entry)
+                        if len(accepted) >= limit:
+                            entry['status'] = 'selection_limit'
+                            save_edit_audit()
+                            continue
+                        if jev_enabled:
+                            segment.start_time_ms, segment.end_time_ms = repair_context_boundaries(
+                                segment.start_time_ms, segment.end_time_ms, segment.editorial, 0, round(video_duration * 1000), round(video_duration * 1000))
+                        else:
+                            # Explicit opt-out bypasses review; provider failures never do.
+                            reviewer.trace(segment.editorial).update(status='skipped', reason='disabled_by_user',
+                                original_interval=entry['original_interval'])
+                        if not jev_enabled or await reviewer.prepare(segment, segment.editorial):
+                            entry['title'] = segment.summary or ''
+                            if any(overlaps([segment.start_time_ms, segment.end_time_ms], [c.start_time_ms, c.end_time_ms]) for c in accepted):
+                                entry['status'] = 'overlap_not_selected'
+                            else:
+                                entry['status'] = 'accepted'
+                                accepted.append(segment)
+                                if jev_enabled:
+                                    await protect_acknowledgments(editorial_service, transcription_result.segments,
+                                                                  segment.start_time_ms, segment.end_time_ms, segment.editorial)
+                        else:
+                            entry['status'] = 'rejected'
+                        save_edit_audit()
+                    # One bounded search for overlooked moments, not repeated attempts to fill a quota.
+                    if (not jev_enabled or discovery_pass == 2 or len(accepted) >= limit or not coherence_service.enabled
+                            or not any(c['status'] == 'rejected' for c in edit_audit['candidates'])
+                            or coherence_service.requests >= coherence_service.max_requests
+                            or coherence_service.reserved_tokens >= coherence_service.token_budget
+                            or not any((a.get('judgment') or {}).get('status') == 'success'
+                                for c in edit_audit['candidates'] for a in c['report'].get('coherence', {}).get('attempts', []))):
+                        break
+                    feedback = discovery_feedback(edit_audit['candidates'], round(video_duration * 1000), edit_audit['preferred_range'])
+                    edit_audit['discovery'] = {'status': 'searching' if feedback['search_intervals'] else 'exhausted', **feedback}
+                    if not feedback['search_intervals']:
+                        break
+                    try:
+                        extra = await self.intelligence_planner.plan_clips(**{**planning_args,
+                            'max_clips': min(8, limit - len(accepted)), 'auto_clip_count': False,
+                            'discovery_feedback': feedback})
+                        # Also enforce exclusions at the pipeline boundary, including mocked/custom planners.
+                        pending = [c for c in extra.segments[:8]
+                            if any(overlaps([c.start_time_ms, c.end_time_ms], span) for span in feedback['search_intervals'])
+                            and not any(overlaps([c.start_time_ms, c.end_time_ms], old['interval']) for old in feedback['previous_candidates'])]
+                        edit_audit['discovery']['status'] = 'completed'
+                        if extra.api_costs:
+                            if clip_plan.api_costs:
+                                for field in ('prompt_tokens', 'completion_tokens', 'total_tokens', 'estimated_cost_usd', 'attempts'):
+                                    setattr(clip_plan.api_costs, field, getattr(clip_plan.api_costs, field) + getattr(extra.api_costs, field))
+                            else:
+                                clip_plan.api_costs = extra.api_costs
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # A failed optional search must not discard already approved clips.
+                        edit_audit['discovery']['status'] = 'unavailable'
+                        pending = []
+                    edit_audit['planner'] = getattr(self.intelligence_planner, 'audit', {'requests': []})
+                    save_edit_audit()
+                    if not pending:
+                        break
+                clip_plan.segments = accepted
+                clip_plan.total_clips = len(accepted)
+                if not accepted:
+                    edit_audit['outcome'] = 'no_approved_clips'
+                    save_edit_audit()
+                    raise CoherenceRejected(no_approved_clips_message([entry['report'] for entry in edit_audit['candidates']]))
+            else:
+                # Render again: the saved plan replaces planning and review.
+                current_stage = 'planning'
+                clip_plan = rerender.plan
+                if not request.auto_clip_count and request.max_clips:
+                    clip_plan.segments = clip_plan.segments[:request.max_clips]
+                clip_plan.total_clips = len(clip_plan.segments)
+                if not clip_plan.segments:
+                    edit_audit['outcome'] = 'no_candidates'
+                    raise NoClipCandidatesError()
+                # The reviewer also summarises repairs after rendering; with
+                # Jev off it only records that review was skipped.
+                reviewer = CoherenceReviewer(coherence_service, self.settings, transcription_result.segments, round(video_duration * 1000))
+                editorial_vision = EditorialVision(self.settings, download_result.video_path, work_dir, round(video_duration * 1000))
+                reviewer.source_context = context_brief
+                reviewer.visual_observer = editorial_vision.observe if getattr(self.settings, 'jev_visual_context', False) else None
+                self._update_progress(job_id, JobStatus.PLANNING, 45,
+                    f"Reusing the saved plan: {clip_plan.total_clips} of {rerender.planned_clips} planned clips...")
+                stage_timings['planning'] = 0.0
+                for i, segment in enumerate(clip_plan.segments):
+                    # A report per clip, each its own object: the audit matches rendered clips by identity.
+                    segment.editorial = dict(segment.editorial) if segment.editorial else empty_report()
+                    edit_audit['candidates'].append({'candidate_index': i, 'title': segment.summary or '', 'discovery_pass': 1,
+                        'original_interval': [segment.start_time_ms, segment.end_time_ms],
+                        'clip_index': None, 'status': 'accepted', 'report': segment.editorial})
+                edit_audit['rerender_from'] = request.rerender_from
                 save_edit_audit()
-                if not pending:
-                    break
-            clip_plan.segments = accepted
-            clip_plan.total_clips = len(accepted)
-            if not accepted:
-                edit_audit['outcome'] = 'no_approved_clips'
-                save_edit_audit()
-                raise CoherenceRejected(no_approved_clips_message([entry['report'] for entry in edit_audit['candidates']]))
 
             plan_data = {
                 "segments": [asdict(s) for s in clip_plan.segments],
                 "total_clips": clip_plan.total_clips,
                 "target_platform": clip_plan.target_platform,
                 "insights": clip_plan.insights,
-                "planning_source": "visual" if visual_frames else "transcript",
+                "planning_source": rerender.planning_source if rerender else "visual" if visual_frames else "transcript",
             }
 
             if self.local_mode:
@@ -645,8 +712,10 @@ class AIClippingPipeline:
                         title_text=segment.summary,
                         include_title=request.include_title,
                         emphasis_words=segment.emphasis_words,
-                        banner_platform=request.banner_platform,
-                        banner_channel_url=request.banner_channel_url,
+                        banner_handle=request.banner_handle,
+                        banner_platforms=request.banner_platforms,
+                        banner_position=(BANNER_MIXED_CYCLE[i % len(BANNER_MIXED_CYCLE)]
+                                         if request.banner_position == "mixed" else request.banner_position),
                         aspect_ratio=request.aspect_ratio,
                         layout_style=request.layout_style,
                         debug_capture=request.debug_capture,
@@ -965,9 +1034,10 @@ class AIClippingPipeline:
                     "video_speed": request.video_speed,
                     "include_title": request.include_title,
                     "clip_request": request.clip_request,
+                    "rerender_from": request.rerender_from,
                 },
                 "transcription_status": transcription_status,
-                "planning_source": "visual" if visual_frames else "transcript",
+                "planning_source": rerender.planning_source if rerender else "visual" if visual_frames else "transcript",
                 "visual_frame_count": len(visual_frames),
                 "captions_status": (
                     "unavailable_without_transcript" if transcription_status != "available"
@@ -1126,6 +1196,49 @@ class AIClippingPipeline:
             self._current_external_job_id = None
             self._current_owner_user_id = None
 
+
+    def _load_rerender(self, run_id: str) -> RerenderSources:
+        """Read a finished run's transcript.json and plan.json back into the
+        objects the render stage needs. Unknown keys from newer or older
+        engines are ignored; missing or damaged files are a user-facing error."""
+        run_dir = os.path.join(self.settings.local_output_dir, run_id)
+        try:
+            with open(os.path.join(run_dir, "transcript.json"), encoding="utf-8") as f:
+                transcript = json.load(f)
+            with open(os.path.join(run_dir, "plan.json"), encoding="utf-8") as f:
+                plan = json.load(f)
+            segments = [
+                TranscriptSegment(
+                    start_time_ms=int(s["start_time_ms"]), end_time_ms=int(s["end_time_ms"]), text=str(s.get("text", "")),
+                    speaker_label=s.get("speaker_label"),
+                    words=[TranscriptWord(str(w["word"]), int(w["start_time_ms"]), int(w["end_time_ms"])) for w in s.get("words") or []],
+                    audio_events=[str(e) for e in s.get("audio_events") or []],
+                )
+                for s in transcript["segments"]
+            ]
+            plan_fields = {f.name for f in dataclass_fields(ClipPlanSegment)}
+            clips = [ClipPlanSegment(**{k: v for k, v in c.items() if k in plan_fields}) for c in plan["segments"]]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise RerenderSourceError(run_id) from e
+        if not clips:
+            raise RerenderSourceError(run_id)
+        for clip in clips:
+            # Rendering state from the earlier run is recomputed. The earlier
+            # review report is kept for the clip summary when it is a complete
+            # one; anything else becomes the "no review" report.
+            clip.render_fallback, clip.output_chapters, clip.subtitle_path = None, [], None
+            if not (isinstance(clip.editorial, dict) and "flags" in clip.editorial):
+                clip.editorial = None
+        transcription = TranscriptionResult(
+            segments=segments, full_text=str(transcript.get("full_text", "")), language=transcript.get("language"),
+        )
+        status = str(transcript.get("status") or ("available" if segments else "no_speech"))
+        return RerenderSources(
+            transcription=transcription, status=status,
+            plan=ClipPlanResponse(segments=clips, total_clips=len(clips), target_platform=str(plan.get("target_platform", "tiktok")),
+                                  insights=plan.get("insights")),
+            planning_source=str(plan.get("planning_source", "transcript")), planned_clips=len(clips),
+        )
 
     def _get_local_output_dir(self, job_id: str) -> str:
         """Get the local output directory for a job, creating it if needed."""

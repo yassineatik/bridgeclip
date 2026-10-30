@@ -1,6 +1,7 @@
 import type { RunDiagnostics } from './run-diagnostics'
 import type { PipelineStage } from './job-progress'
 import type { JobOutput } from './job-output'
+import type { BannerPosition } from './job-contract'
 
 /** Options for one clipping run, as the Create wizard submits them. */
 export interface ClipJobRequest {
@@ -28,8 +29,20 @@ export interface ClipJobRequest {
   includeTitle?: boolean
   startTimeSeconds: number | null
   endTimeSeconds: number | null
-  bannerPlatform: string | null
-  bannerChannelUrl: string | null
+  /** One handle shown on every clip, e.g. @YassInPublic; null hides the banner. */
+  bannerHandle: string | null
+  /** Platforms whose icons precede the handle, canonical order. */
+  bannerPlatforms: string[]
+  /** Where the banner sits (see BANNER_POSITIONS). Older requests omit it: auto. */
+  bannerPosition?: BannerPosition
+  /**
+   * Render again: the id (output folder name) of a finished run whose saved
+   * transcript and clip plan are reused. Download-side research,
+   * transcription, planning, Jev and vision are skipped, so nothing is
+   * billed; `maxClips` keeps the first N planned clips (null: all). The
+   * result is a new run.
+   */
+  rerenderFrom?: string
 }
 
 /** How many clipping runs the main process lets run at once; the rest wait in a queue. */

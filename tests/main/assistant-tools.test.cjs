@@ -61,8 +61,8 @@ test('start_clip_job builds a request the Create page’s validator accepts, wit
     includeTitle: true,
     startTimeSeconds: null,
     endTimeSeconds: null,
-    bannerPlatform: null,
-    bannerChannelUrl: null
+    bannerHandle: null,
+    bannerPlatforms: []
   })
   assert.doesNotThrow(() => mod.validateJobConfig(minimal))
   const custom = mod.clipJobRequestFromInput({

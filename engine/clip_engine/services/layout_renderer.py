@@ -20,7 +20,7 @@ from bisect import bisect_left
 from dataclasses import dataclass
 from fractions import Fraction
 from math import ceil
-from typing import Optional
+from typing import Optional, Sequence
 
 from clip_engine.services.layout_analyzer import Box, ClipLayoutPlan, LayoutType, ShotLayout
 from clip_engine.services.video_speed import speed_audio_filter, validate_video_speed
@@ -667,11 +667,24 @@ def build_layout_graph(
 # Overlay placement per layout (output pixels)
 # ------------------------------------------------------------------
 
+# (x0, y0, x1, y1) in output pixels.
+Rect = tuple[int, int, int, int]
+
 # Captions on a full-frame speaker sit in the lower third, clear of the face
 # and above the platform UI.
 FILL_CAPTION_Y = 1340
-FILL_BANNER_Y = 1590
 TOP_TITLE_Y = 110
+# Shorts, TikTok and Reels draw their like/comment/share buttons, the post
+# text and the progress bar over roughly the bottom fifth of a 9:16 frame.
+# The channel banner's bottom edge never goes below this share of the height.
+PLATFORM_UI_TOP = 0.80
+# Space kept between the banner and the picture or the captions (px at 1920).
+BANNER_GAP = 24
+# Tallest caption block the presets draw, two lines of the default face plus
+# their effects (px at 1920). The banner keeps out of this band at the anchor.
+CAPTION_BLOCK_H = 200
+# Bottom of the title card at its usual spot (TOP_TITLE_Y plus two lines), px at 1920.
+BELOW_TITLE_Y = 250
 
 
 def caption_anchor(shot: ShotLayout, src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, int]:
@@ -694,12 +707,166 @@ def title_y(shot: ShotLayout, src_w: int, src_h: int, out_w: int, out_h: int, ti
     return int(out_h * TOP_TITLE_Y / 1920)
 
 
-def banner_y(shot: ShotLayout, src_w: int, src_h: int, out_w: int, out_h: int) -> int:
+def caption_span(shot: ShotLayout, src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, int]:
+    """(top, bottom) of the band captions occupy at their anchor during this shot."""
+    alignment, y = caption_anchor(shot, src_w, src_h, out_w, out_h)
+    block = int(out_h * CAPTION_BLOCK_H / 1920)
+    if alignment in (1, 2, 3):
+        return y - block, y
+    if alignment in (7, 8, 9):
+        return y, y + block
+    return y - block // 2, y + block // 2
+
+
+# Where the user wants the banner: "auto", "mixed", or "<vertical>-<horizontal>"
+# ("bottom-left"; a bare "bottom" means "bottom-center"). "mixed" is resolved
+# per clip before the render (ai_clipping_pipeline cycles BANNER_MIXED_CYCLE).
+BANNER_VERTICAL = ("top", "middle", "bottom")
+BANNER_HORIZONTAL = ("left", "center", "right")
+BANNER_MIXED_CYCLE = (
+    "bottom-center", "top-right", "middle-left", "bottom-right", "top-center",
+    "middle-right", "bottom-left", "top-left", "middle-center",
+)
+# Side margin of a left or right aligned banner (px at 1080 wide).
+BANNER_SIDE_MARGIN = 40
+
+
+def parse_banner_position(position: Optional[str]) -> tuple[str, str]:
+    """(vertical, horizontal) of a position string; anything unknown is auto, centered."""
+    if not position or position == "auto":
+        return "auto", "center"
+    vertical, _, horizontal = position.partition("-")
+    if vertical not in BANNER_VERTICAL:
+        return "auto", "center"
+    return vertical, horizontal if horizontal in BANNER_HORIZONTAL else "center"
+
+
+def is_banner_position(position: object) -> bool:
+    if not isinstance(position, str):
+        return False
+    if position in ("auto", "mixed"):
+        return True
+    vertical, dash, horizontal = position.partition("-")
+    return vertical in BANNER_VERTICAL and (horizontal in BANNER_HORIZONTAL if dash else True)
+
+
+def banner_x_span(horizontal: str, out_w: int, banner_w: int) -> tuple[float, float]:
+    """(left, right) columns a banner `banner_w` wide covers when aligned `horizontal`."""
+    margin = round(out_w * BANNER_SIDE_MARGIN / 1080)
+    if horizontal == "left":
+        return margin, margin + banner_w
+    if horizontal == "right":
+        return out_w - margin - banner_w, out_w - margin
+    return (out_w - banner_w) / 2, (out_w + banner_w) / 2
+
+
+def banner_x_expr(horizontal: str, out_w: int) -> str:
+    """FFmpeg overlay x for a banner aligned `horizontal` on a frame `out_w` wide."""
+    margin = round(out_w * BANNER_SIDE_MARGIN / 1080)
+    return {"left": f"{margin}", "right": f"W-w-{margin}"}.get(horizontal, "(W-w)/2")
+
+
+def banner_y(
+    shot: ShotLayout, src_w: int, src_h: int, out_w: int, out_h: int, banner_h: int = 0,
+    avoid_captions: bool = True, faces: Sequence[Rect] = (), banner_w: int = 0,
+    position: str = "auto", title_shown: bool = True,
+) -> int:
+    """Top edge of a channel banner `banner_w` x `banner_h` during this shot.
+
+    The banner stays above the platform UI (PLATFORM_UI_TOP), below the title
+    card and off the caption band (unless the clip has no captions). Spots
+    come in three regions: bottom (as low as the platform UI allows, then
+    under the captions), middle (between a screen layout's picture and its
+    captions, else just above or below the captions) and top (the bar above
+    a screen layout's picture, then under the title).
+
+    "auto" tries the bar under a screen layout's picture, then the bottom,
+    middle and top regions, and takes the first spot clear of every face in
+    `faces` (output-pixel rects seen during the shot, under the banner's own
+    columns); when a face is everywhere, the spot covering the least face.
+    A chosen region stays that region: its spot covering the least face wins,
+    and only when the captions leave it no room does the search move on.
+    """
+    vertical, horizontal = parse_banner_position(position)
+    gap = round(out_h * BANNER_GAP / 1920)
+    lowest = int(out_h * PLATFORM_UI_TOP) - banner_h
+    highest = int(out_h * (BELOW_TITLE_Y if title_shown else TOP_TITLE_Y) / 1920) + (gap if title_shown else 0)
+    cap_top, cap_bottom = caption_span(shot, src_w, src_h, out_w, out_h)
+    if not avoid_captions:
+        cap_top = cap_bottom = -out_h  # nothing to keep off
+
+    # Faces under the banner's columns, as (top, bottom) spans to keep a gap
+    # from. The detector box runs brows to chin; a banner just above the
+    # hairline is fine (captions keep further away, they are much bigger).
+    left, right = banner_x_span(horizontal, out_w, banner_w)
+    keep_clear = []
+    for x0, y0, x1, y1 in faces:
+        w = x1 - x0
+        if banner_w and not (x1 + w * FACE_PAD_X > left and x0 - w * FACE_PAD_X < right):
+            continue
+        keep_clear.append((y0 - gap, y1 + gap))
+
+    def face_overlap(y: int) -> float:
+        return sum(max(0.0, min(y + banner_h, b) - max(y, a)) for a, b in keep_clear)
+
+    def allowed(y: int) -> bool:
+        return highest <= y <= lowest and (y + banner_h <= cap_top - gap or y >= cap_bottom + gap)
+
+    bottom = [lowest, cap_bottom + gap]
+    middle = [cap_top - gap - banner_h, cap_bottom + gap]
+    top = [highest]
+    auto = bottom + middle + top
     if shot.layout == LayoutType.SCREEN:
         scaled_h, overlay_y = foreground_geometry(shot, src_w, src_h, out_w, out_h)
-        if out_h - (overlay_y + scaled_h) >= 120:
-            return overlay_y + scaled_h + 25
-    return int(out_h * FILL_BANNER_Y / 1920)
+        under_picture = overlay_y + scaled_h + gap
+        bottom = [lowest, cap_bottom + gap, under_picture]
+        middle = [under_picture, cap_top - gap - banner_h, cap_bottom + gap]
+        top = [overlay_y - gap - banner_h, highest]
+        auto = [under_picture, cap_bottom + gap, lowest] + middle + top
+    def spots(order: Sequence[int]) -> list[int]:
+        chosen: list[int] = []
+        for y in order:
+            if allowed(y) and y not in chosen:
+                chosen.append(y)
+        return chosen
+
+    def least_covered(candidates: list[int]) -> int:
+        return min(candidates, key=lambda y: (face_overlap(y), candidates.index(y)))
+
+    if vertical != "auto":
+        region = {"top": top, "middle": middle, "bottom": bottom}[vertical]
+        chosen = spots(region)
+        if chosen:
+            return least_covered(chosen)
+        auto = region + {"top": middle + bottom, "middle": bottom + top, "bottom": middle + top}[vertical]
+    candidates = spots(auto)
+    if not candidates:
+        return max(0, min(lowest, cap_top - gap - banner_h))
+    for y in candidates:
+        if face_overlap(y) == 0:
+            return y
+    return least_covered(candidates)
+
+
+def faces_during(zones: Sequence["FaceZone"], start_ms: int, end_ms: int) -> list[Rect]:
+    """Every face rect on screen at any time in [start_ms, end_ms) of output time."""
+    return [rect for zone in zones if zone.end_ms > start_ms and zone.start_ms < end_ms for rect in zone.rects]
+
+
+def banner_obstacles(
+    plan: ClipLayoutPlan, src_w: int, src_h: int, out_w: int, out_h: int, banner_h: int,
+    faces_by_shot: Optional[Sequence[Sequence[Rect]]] = None, banner_w: int = 0,
+    position: str = "auto", title_shown: bool = True,
+) -> list[tuple[int, int]]:
+    """(top, bottom) of the banner during each shot of `plan`, for CaptionPlacer
+    to keep moved captions off."""
+    faces_by_shot = faces_by_shot or [()] * len(plan.shots)
+    spans = []
+    for shot, faces in zip(plan.shots, faces_by_shot):
+        y = banner_y(shot, src_w, src_h, out_w, out_h, banner_h, faces=faces, banner_w=banner_w,
+                     position=position, title_shown=title_shown)
+        spans.append((y, y + banner_h))
+    return spans
 
 
 def per_shot_expr(plan: ClipLayoutPlan, values: list[float]) -> str:
@@ -714,8 +881,6 @@ def per_shot_expr(plan: ClipLayoutPlan, values: list[float]) -> str:
 # Faces on the output frame, for caption placement
 # ------------------------------------------------------------------
 
-# (x0, y0, x1, y1) in output pixels.
-Rect = tuple[int, int, int, int]
 
 # Detections are 1/ANALYSIS_FPS (250 ms) apart. Each one covers this long on
 # either side, so a missed frame doesn't open a gap a caption could drop into.
@@ -866,17 +1031,23 @@ class CaptionPlacer:
     A group starts at its shot's anchor (caption_anchor). If that would cover
     a face visible at any time while the group is up, it moves just below or
     above the faces, whichever is nearer the anchor, inside the band clear of
-    the title and banner. Later groups in the same shot keep a moved position
+    the title and platform UI and off the channel banner. Later groups in the same shot keep a moved position
     while it stays clear, so captions don't hop between phrases. If no spot
     is clear, the one covering the least face wins.
     """
 
-    def __init__(self, anchors: list[tuple[int, int, int]], zones: list[FaceZone], out_w: int, out_h: int):
+    def __init__(
+        self, anchors: list[tuple[int, int, int]], zones: list[FaceZone], out_w: int, out_h: int,
+        obstacles: Optional[Sequence[tuple[int, int]]] = None,
+    ):
         self.anchors = anchors  # (until_ms, alignment, y), as for CaptionGeneratorService._apply_anchors
         self.zones = sorted(zones, key=lambda z: z.start_ms)
         self._starts = [z.start_ms for z in self.zones]
         self._longest = max((z.end_ms - z.start_ms for z in self.zones), default=0)
         self.out_w, self.out_h = out_w, out_h
+        # One (top, bottom) per anchor that a moved caption must also keep off:
+        # the channel banner's place during that shot (banner_obstacles).
+        self.obstacles = list(obstacles or [])
         self._last: Optional[tuple[int, float]] = None  # (anchor index, center y)
 
     def faces_during(self, start_ms: int, end_ms: int) -> list[Rect]:
@@ -901,6 +1072,10 @@ class CaptionPlacer:
                     y0 - h * FACE_PAD_TOP - CAPTION_FACE_GAP,
                     y1 + min(h * FACE_PAD_BOTTOM, MAX_FACE_PAD_BOTTOM_PX) + CAPTION_FACE_GAP,
                 ))
+        if index < len(self.obstacles):
+            a, b = self.obstacles[index]
+            faces.append((a, b))  # covering the banner is as bad as covering a face
+            keep_clear.append((a - CAPTION_FACE_GAP, b + CAPTION_FACE_GAP))
 
         top, bottom = self.out_h * CAPTION_TOP_LIMIT + half, self.out_h * CAPTION_BOTTOM_LIMIT - half
         if top > bottom:

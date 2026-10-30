@@ -44,11 +44,13 @@ bridgeclip/resources/bridgeclip-icon.svg
 bridgeclip/resources/bridgeclip-logo-light.svg
 bridgeclip/resources/bridgeclip-logo.svg
 bridgeclip/resources/bridgemind-mark.svg
+bridgeclip/scripts/banner-icons.py
 bridgeclip/scripts/build-ffmpeg-mac.sh
 bridgeclip/scripts/export-public-draft.sh
 bridgeclip/scripts/icon/build-icons.sh
 bridgeclip/scripts/icon/README.md
 bridgeclip/scripts/icon/build-logo.py
+bridgeclip/scripts/install-local-mac.sh
 bridgeclip/scripts/icon/icon.html
 bridgeclip/scripts/icon/render.js
 bridgeclip/scripts/licenses/LGPL-2.1-or-later.txt
@@ -156,6 +158,7 @@ bridgeclip/tests/main/job-manager.test.cjs
 bridgeclip/tests/main/local-file.e2e.cjs
 bridgeclip/tests/main/media-security.test.cjs
 bridgeclip/tests/main/posting.test.cjs
+bridgeclip/tests/main/rerender.test.cjs
 bridgeclip/tests/main/security.test.cjs
 bridgeclip/tests/renderer-state.test.cjs
 bridgeclip/tests/zernio/accounts-store.test.cjs
@@ -191,6 +194,10 @@ bridgeclip/engine/assets/fonts/PlusJakartaSans.ttf
 bridgeclip/engine/assets/fonts/Poppins-Black.ttf
 bridgeclip/engine/assets/fonts/Poppins-ExtraBold.ttf
 bridgeclip/engine/assets/fonts/Poppins-OFL.txt
+bridgeclip/engine/assets/icons/instagram.png
+bridgeclip/engine/assets/icons/tiktok.png
+bridgeclip/engine/assets/icons/x.png
+bridgeclip/engine/assets/icons/youtube.png
 bridgeclip/engine/assets/models/YuNet-LICENSE
 bridgeclip/engine/assets/models/face_detection_yunet_2023mar.onnx
 bridgeclip/engine/clip_engine/__init__.py
@@ -297,6 +304,8 @@ bridgeclip/docs/SECURITY_REVIEW_2026-09-27.md
 bridgeclip/engine/tests/test_audit_infra.py
 bridgeclip/engine/tests/test_audit_network.py
 bridgeclip/engine/tests/test_audit_render.py
+bridgeclip/engine/tests/test_channel_banner.py
+bridgeclip/engine/tests/test_rerender.py
 bridgeclip/resources/social/README.md
 bridgeclip/resources/social/banner-app-prompt.md
 bridgeclip/resources/social/banner-prompt.md
