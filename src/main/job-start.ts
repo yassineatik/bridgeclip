@@ -1,11 +1,13 @@
 import { randomUUID } from 'crypto'
+import { existsSync, readFileSync } from 'fs'
+import { join } from 'path'
 import { loadSettings } from './settings-store'
 import { ensureOutputDir } from './file-manager'
 import { getBridgeRunnerPath, getEnginePath, preflightCheck, resolvePythonPath, validatePython, type ClipJobConfig } from './pipeline-runner'
 import { createRunRecord, finishRunRecord } from './run-history'
 import { enqueueJob } from './job-manager'
 import { logger } from './logger'
-import { assertMediaPath, isWebUrl } from './security'
+import { assertMediaPath, authorizeMedia, isWebUrl } from './security'
 import { assertPublicWebUrl } from './network-policy'
 import { validateJobConfig } from './validation'
 import { resolveAdvancedModels } from './openrouter-models'
@@ -17,6 +19,22 @@ const ENGINE_CHECK_TTL_MS = 5 * 60 * 1000
 let lastEngineCheck: { key: string; at: number } | null = null
 
 export type StartJobResult = { jobId: string; queued: boolean; job: JobSnapshot } | { error: string }
+
+/** The run folder keeps what a re-render reuses (validation already bounds the id to one folder name). */
+export function hasRerenderSources(outputDirectory: string, runId: string): boolean {
+  const run = join(outputDirectory, runId)
+  return existsSync(join(run, 'transcript.json')) && existsSync(join(run, 'plan.json'))
+}
+
+/** The source video a finished run was clipped from, as its job_output.json records it; null when unreadable. */
+export function recordedRerenderSource(outputDirectory: string, runId: string): string | null {
+  try {
+    const output = JSON.parse(readFileSync(join(outputDirectory, runId, 'job_output.json'), 'utf8')) as { source_video_url?: unknown }
+    return typeof output.source_video_url === 'string' && output.source_video_url ? output.source_video_url : null
+  } catch {
+    return null
+  }
+}
 
 /**
  * Validate a clipping request, check the engine and keys, create its run
@@ -30,12 +48,24 @@ export async function startClipJobRequest(request: unknown): Promise<StartJobRes
     if (config.clippingMode === 'advanced') {
       config.plannerCapabilities = await resolveAdvancedModels(config.plannerModel!, config.transcriptionModel!)
     }
+    if (config.rerenderFrom !== undefined) {
+      // A re-render clips the run's own source again. A local file outside
+      // the library is allowed only when it is the file that run recorded.
+      if (config.videoUrl !== recordedRerenderSource(loadSettings().outputDirectory, config.rerenderFrom)) {
+        return { error: 'Render again uses the source video this run was clipped from.' }
+      }
+      if (!isWebUrl(config.videoUrl)) authorizeMedia(config.videoUrl)
+    }
     if (isWebUrl(config.videoUrl)) await assertPublicWebUrl(config.videoUrl)
     else assertMediaPath(config.videoUrl, loadSettings().outputDirectory)
-    if (config.bannerChannelUrl) await assertPublicWebUrl(config.bannerChannelUrl)
   } catch (error) { return { error: error instanceof Error ? error.message : 'Invalid job options' } }
   const settings = loadSettings()
 
+  if (config.rerenderFrom !== undefined && !hasRerenderSources(settings.outputDirectory, config.rerenderFrom)) {
+    return { error: 'This run has no saved transcript and plan to render again.' }
+  }
+  // A re-render reuses the saved transcript and plan, so it spends no credit,
+  // but the engine still builds its provider services from the key.
   if (!settings.openrouterApiKey) {
     logger.warn('job.start.missingKey', { key: 'OPENROUTER_API_KEY' })
     return { error: 'OpenRouter API key is required for AI clip planning. Go to Settings to add it.' }

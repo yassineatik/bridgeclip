@@ -135,7 +135,10 @@ def test_inset_counts_as_smart_framing_and_overlays_use_actual_foreground():
     (_, _, _, _), (_, y, _, h) = shot_views(shot, 0, 640, 360, 1080, 1920)[0]
     assert foreground_geometry(shot, 640, 360, 1080, 1920) == (h, y)
     assert title_y(shot, 640, 360, 1080, 1920, 100) + 100 < y
-    assert banner_y(shot, 640, 360, 1080, 1920) > y + h
+    # The bar under this inset lies in the platform UI zone, so the banner
+    # stays above that zone (over the lower edge of the picture) instead.
+    assert y + h > 1920 * 0.8
+    assert banner_y(shot, 640, 360, 1080, 1920, 48) + 48 <= 1920 * 0.8
 
 
 def pillarbox_frame():

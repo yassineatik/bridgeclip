@@ -257,7 +257,7 @@ test('source video links normalize supported YouTube forms and allow only canoni
 })
 
 test('job validation rejects malformed options and invalid trim intervals', () => {
-  const job = { videoUrl: 'https://example.com/video', maxClips: 5, autoClipCount: true, includeCaptions: true, aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: true, pacing: 'tight', captionPreset: 'pop', durationRanges: ['short'], startTimeSeconds: null, endTimeSeconds: null, bannerPlatform: null, bannerChannelUrl: null }
+  const job = { videoUrl: 'https://example.com/video', maxClips: 5, autoClipCount: true, includeCaptions: true, aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: true, pacing: 'tight', captionPreset: 'pop', durationRanges: ['short'], startTimeSeconds: null, endTimeSeconds: null, bannerHandle: null, bannerPlatforms: [] }
   assert.doesNotThrow(() => validateJobConfig(job))
   assert.equal(validateJobConfig(job).videoSpeed, 1)
   assert.equal(validateJobConfig(job).includeTitle, true)
@@ -288,6 +288,50 @@ test('job validation rejects malformed options and invalid trim intervals', () =
   for (const option of jobContract.DURATION_OPTIONS) assert.doesNotThrow(() => validateJobConfig({ ...job, durationRanges: [option.id] }))
   assert.equal(validateJobConfig({ ...job, videoUrl: 'https://go.twitch.tv/videos/123?t=30s' }).videoUrl, 'https://www.twitch.tv/videos/123')
   for (const videoUrl of ['https://twitch.tv/channel', 'https://clips.twitch.tv/Clip']) assert.throws(() => validateJobConfig({ ...job, videoUrl }), /completed Twitch VOD/)
+  // Channel banner: one handle, drawn as typed with a leading @, after the chosen platforms' icons.
+  // Arrays come back from the module's own realm, so compare their contents.
+  const bannerOf = (config) => [config.bannerHandle, [...config.bannerPlatforms]]
+  assert.deepEqual(bannerOf(validateJobConfig(job)), [null, []])
+  assert.equal(validateJobConfig({ ...job, bannerHandle: 'YassInPublic' }).bannerHandle, '@YassInPublic')
+  assert.equal(validateJobConfig({ ...job, bannerHandle: ' @Yass.In_Public-1 ' }).bannerHandle, '@Yass.In_Public-1')
+  for (const bannerHandle of ['yass in public', '@' + 'a'.repeat(64), 'https://x.com/yass', '@', '', 3, ['@yass']]) {
+    assert.throws(() => validateJobConfig({ ...job, bannerHandle }), /handle/)
+  }
+  // Render again: a run id selects the saved plan, so planning and vision options are dropped.
+  const again = validateJobConfig({ ...job, rerenderFrom: 'run_9e15-ABC', clipRequest: 'pricing', startTimeSeconds: 5, endTimeSeconds: 50, layoutVision: true, maxClips: 3, autoClipCount: false })
+  assert.equal(again.rerenderFrom, 'run_9e15-ABC')
+  assert.deepEqual([again.workflow, again.clipRequest, again.durationRanges, again.startTimeSeconds, again.endTimeSeconds, again.layoutVision, again.maxClips],
+    ['automatic', undefined, null, null, null, false, 3])
+  assert.equal(validateJobConfig(again).rerenderFrom, 'run_9e15-ABC')
+  assert.equal(validateJobConfig({ ...job, rerenderFrom: 'abc', workflow: 'automatic' }).rerenderFrom, 'abc')
+  for (const rerenderFrom of ['../x', 'a b', '', 'a/b', 'a'.repeat(129), 3, null, ['abc']]) {
+    assert.throws(() => validateJobConfig({ ...job, rerenderFrom }), /render again/)
+  }
+  assert.throws(() => validateJobConfig({ ...job, rerenderFrom: 'abc', workflow: 'review' }), /Automatic/)
+  assert.equal(validateJobConfig(job).rerenderFrom, undefined)
+  const banner = { ...job, bannerHandle: '@YassInPublic', bannerPlatforms: ['instagram', 'youtube'] }
+  assert.deepEqual([...validateJobConfig(banner).bannerPlatforms], ['youtube', 'instagram'])
+  for (const bannerPlatforms of [['youtube', 'youtube'], ['facebook'], 'youtube', [1], null]) {
+    assert.throws(() => validateJobConfig({ ...banner, bannerPlatforms }), /banner platforms/)
+  }
+  // Platforms mean nothing without a handle, and older stored requests carry neither field.
+  assert.deepEqual([...validateJobConfig({ ...job, bannerPlatforms: ['x'] }).bannerPlatforms], [])
+  const legacy = { ...job }
+  delete legacy.bannerHandle
+  delete legacy.bannerPlatforms
+  assert.deepEqual(bannerOf(validateJobConfig(legacy)), [null, []])
+  const storedBanner = validateJobConfig(banner)
+  assert.deepEqual(bannerOf(validateJobConfig(storedBanner)), bannerOf(storedBanner))
+  // Banner position: auto, mixed or a 3x3 grid spot; defaults to auto only once there is a handle.
+  for (const bannerPosition of ['auto', 'mixed', 'bottom-left', 'middle-center', 'top-right']) assert.equal(validateJobConfig({ ...banner, bannerPosition }).bannerPosition, bannerPosition)
+  // Requests saved before the grid used a vertical word alone: the center column.
+  for (const [legacy, stored] of [['top', 'top-center'], ['middle', 'middle-center'], ['bottom', 'bottom-center']]) {
+    assert.equal(validateJobConfig({ ...banner, bannerPosition: legacy }).bannerPosition, stored)
+    assert.equal(validateJobConfig({ ...job, bannerPosition: legacy }).bannerPosition, stored)
+  }
+  assert.equal(validateJobConfig(banner).bannerPosition, 'auto')
+  assert.equal(validateJobConfig(job).bannerPosition, undefined)
+  for (const bannerPosition of ['left', 'top-top', 'center-center', 3, null, '']) assert.throws(() => validateJobConfig({ ...job, bannerPosition }), /banner position/)
   for (const patch of [{ maxClips: -1 }, { startTimeSeconds: NaN }, { startTimeSeconds: 5, endTimeSeconds: 3 }, { videoUrl: 'file:///etc/passwd' }, { durationRanges: ['unexpected'] }, { includeCaptions: 'false' }, { includeTitle: 'false' }, { layoutVision: 'true' }, { aspectRatio: '1:1' }, { clippingMode: 'unknown' }]) assert.throws(() => validateJobConfig({ ...job, ...patch }))
 })
 

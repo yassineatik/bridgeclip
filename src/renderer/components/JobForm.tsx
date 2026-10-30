@@ -1,8 +1,8 @@
 import { normalizeVideoSource, twitchSourceError } from '../../shared/video-source'
 import { useEffect, useMemo, type ReactNode } from 'react'
-import { ArrowLeft, ArrowRight, Check, CheckCircle2, Clock3, ListVideo, Minus, Plus, Sparkles } from 'lucide-react'
+import { ArrowLeft, ArrowRight, Check, CheckCircle2, Clock3, ListVideo, Minus, Plus, RotateCcw, Sparkles } from 'lucide-react'
 import { cn, MOD_KEY, parseTimecode, sourceLabel } from '../lib/utils'
-import { useDraftStore, type ClipDraft, type WizardStep } from '../store/use-draft-store'
+import { useDraftStore, type ClipDraft, type RerenderSource, type WizardStep } from '../store/use-draft-store'
 import { useActiveJobs } from '../store/use-job-store'
 import type { ClipJobRequest } from '../../shared/jobs'
 import { MAX_PARALLEL_JOBS } from '../../shared/jobs'
@@ -10,12 +10,13 @@ import { CaptionPresetPicker, CAPTION_PRESET_NAMES } from './CaptionPresetPicker
 import { SourcePicker } from './SourcePicker'
 import { Panel } from './ui/Panel'
 import { Switch } from './ui/Switch'
+import { Checkbox } from './ui/Checkbox'
 import { Button } from './ui/Button'
 import { TextArea, TextInput } from './ui/Field'
 import { IconTile } from './ui/IconTile'
 import { SettingRow } from './ui/SettingRow'
 import { onRadioKeyDown } from './ui/Segmented'
-import { CLIP_REQUEST_MAX_CHARS, DURATION_OPTIONS, VIDEO_SPEED_OPTIONS } from '../../shared/job-contract'
+import { BANNER_GRID_POSITION_IDS, BANNER_HANDLE_MAX_CHARS, BANNER_PLATFORMS, CLIP_REQUEST_MAX_CHARS, DURATION_OPTIONS, VIDEO_SPEED_OPTIONS, bannerPositionLabel, canonicalBannerPlatforms, isBannerHandle, normalizeBannerHandle, type BannerPosition } from '../../shared/job-contract'
 import { isModelId } from '../../shared/openrouter-models'
 import { useModelStore } from '../store/use-model-store'
 import { useSettingsStore } from '../store/use-settings-store'
@@ -58,9 +59,42 @@ export function parseTrimRange(enabled: boolean, startText: string, endText: str
   return { start, end, error }
 }
 
+/** Why the channel handle can't be used, or null when blank or valid. */
+export function bannerHandleError(handle: string): string | null {
+  return handle.trim() && !isBannerHandle(handle) ? 'Use letters, numbers, dots, underscores or dashes.' : null
+}
+
 /** The run request for the current draft. */
 export function buildJobRequest(draft: ClipDraft, trim: { start: number | null; end: number | null }): ClipJobRequest {
   if (!draft.workflow) throw new Error('Choose a workflow before creating clips.')
+  const bannerHandle = normalizeBannerHandle(draft.bannerHandle ?? '')
+  const rerender = draft.rerenderFrom ?? null
+  if (rerender) {
+    // A re-render keeps the run's saved plan: no planning options, no paid vision checks.
+    return {
+      videoUrl: normalizeVideoSource(draft.source),
+      workflow: 'automatic',
+      clippingMode: draft.clippingMode,
+      ...(draft.clippingMode === 'advanced' ? { plannerModel: draft.plannerModel, transcriptionModel: draft.transcriptionModel } : {}),
+      maxClips: draft.autoClipCount ? null : Math.min(draft.maxClips, rerender.clipCount),
+      autoClipCount: draft.autoClipCount,
+      durationRanges: null,
+      aspectRatio: draft.aspectRatio,
+      layoutStyle: draft.layoutStyle,
+      layoutVision: false,
+      pacing: draft.pacing,
+      videoSpeed: draft.videoSpeed ?? 1,
+      includeCaptions: draft.includeCaptions,
+      captionPreset: draft.captionPreset,
+      includeTitle: draft.includeTitle,
+      startTimeSeconds: null,
+      endTimeSeconds: null,
+      bannerHandle,
+      bannerPlatforms: bannerHandle ? canonicalBannerPlatforms(draft.bannerPlatforms ?? []) : [],
+      ...(bannerHandle ? { bannerPosition: draft.bannerPosition ?? 'auto' } : {}),
+      rerenderFrom: rerender.jobId
+    }
+  }
   return {
     videoUrl: normalizeVideoSource(draft.source),
     workflow: draft.workflow,
@@ -80,8 +114,9 @@ export function buildJobRequest(draft: ClipDraft, trim: { start: number | null; 
     includeTitle: draft.includeTitle,
     startTimeSeconds: trim.start,
     endTimeSeconds: trim.end,
-    bannerPlatform: null,
-    bannerChannelUrl: null
+    bannerHandle,
+    bannerPlatforms: bannerHandle ? canonicalBannerPlatforms(draft.bannerPlatforms ?? []) : [],
+    ...(bannerHandle ? { bannerPosition: draft.bannerPosition ?? 'auto' } : {})
   }
 }
 
@@ -113,12 +148,14 @@ export function JobForm({ onSubmit, onViewJob, blockedReason, submitting, classN
 
   const index = WIZARD_STEPS.findIndex((s) => s.id === step)
   const meta = WIZARD_STEPS[index]
-  const sourceError = twitchSourceError(draft.source)
+  const rerender = draft.rerenderFrom
+  const sourceError = rerender ? null : twitchSourceError(draft.source)
   const hasSource = Boolean(draft.source.trim()) && !sourceError
-  const videoValid = hasSource && draft.workflow !== null && !trim.error
+  const videoValid = rerender ? hasSource : hasSource && draft.workflow !== null && !trim.error
   const modelsValid = draft.clippingMode !== 'advanced' || (isModelId(draft.plannerModel) && isModelId(draft.transcriptionModel))
-  const stepValid = videoValid && (step !== 'clips' || modelsValid)
-  const canSubmit = videoValid && modelsValid && !blockedReason && !submitting && !draft.started
+  const bannerValid = bannerHandleError(draft.bannerHandle) === null
+  const stepValid = videoValid && (step !== 'clips' || modelsValid) && (step !== 'captions' || bannerValid)
+  const canSubmit = videoValid && modelsValid && bannerValid && !blockedReason && !submitting && !draft.started
 
   const submit = (): void => {
     if (canSubmit) onSubmit(buildJobRequest(draft, trim))
@@ -167,7 +204,9 @@ export function JobForm({ onSubmit, onViewJob, blockedReason, submitting, classN
           <p className="mt-0.5 text-xs text-ink-muted">{step === 'review' && draft.workflow === 'review' ? 'Jev reviews each candidate before the editor opens for your final cut.' : meta.description}</p>
         </div>}
         {sourceError && <p role="alert" className="text-sm text-danger">{sourceError}</p>}
-        {step === 'video' && <VideoStep draft={draft} update={update} trimError={trim.error} disabled={submitting} />}
+        {step === 'video' && (rerender
+          ? <RerenderNotice run={rerender} onStartOver={draft.startAnother} />
+          : <VideoStep draft={draft} update={update} trimError={trim.error} disabled={submitting} />)}
         {step === 'format' && <FormatStep draft={draft} update={update} />}
         {step === 'clips' && <ClipsStep draft={draft} update={update} />}
         {step === 'captions' && <CaptionsStep draft={draft} update={update} />}
@@ -182,13 +221,13 @@ export function JobForm({ onSubmit, onViewJob, blockedReason, submitting, classN
           </Button>
         ) : <span />}
         <p className="min-w-0 flex-1 truncate text-center text-2xs text-ink-subtle">
-          {blockedReason ?? (!draft.workflow ? 'Choose a workflow to continue.' : !modelsValid ? 'Choose both models in Advanced mode.' : step === 'video' && !hasSource ? 'Add a video to continue.' : `${MOD_KEY}↵ generates from any step`)}
+          {blockedReason ?? (!draft.workflow ? 'Choose a workflow to continue.' : !modelsValid ? 'Choose both models in Advanced mode.' : !bannerValid ? 'Fix the channel handle to continue.' : step === 'video' && !hasSource ? 'Add a video to continue.' : `${MOD_KEY}↵ generates from any step`)}
         </p>
         {next && step !== 'review' ? (
           <div className="flex items-center gap-2">
             {step !== 'video' && (
               <Button variant="ghost" onClick={submit} disabled={!canSubmit} loading={submitting} className="max-sm:hidden">
-                {draft.workflow === 'review' ? 'Find candidates' : 'Generate now'}
+                {rerender ? rerenderLabel(draft) : draft.workflow === 'review' ? 'Find candidates' : 'Generate now'}
               </Button>
             )}
             <Button variant="primary" trailingIcon={<ArrowRight className="h-3.5 w-3.5" />} onClick={() => goTo(next.id)} disabled={!stepValid}>
@@ -196,8 +235,8 @@ export function JobForm({ onSubmit, onViewJob, blockedReason, submitting, classN
             </Button>
           </div>
         ) : (
-          <Button variant="primary" size="lg" icon={<Sparkles className="h-4 w-4" />} onClick={submit} disabled={!canSubmit} loading={submitting}>
-            {draft.workflow === 'review' ? 'Find candidates' : 'Generate clips'}
+          <Button variant="primary" size="lg" icon={rerender ? <RotateCcw className="h-4 w-4" /> : <Sparkles className="h-4 w-4" />} onClick={submit} disabled={!canSubmit} loading={submitting}>
+            {rerender ? rerenderLabel(draft) : draft.workflow === 'review' ? 'Find candidates' : 'Generate clips'}
           </Button>
         )}
       </div>
@@ -244,6 +283,34 @@ function Stepper({ current, reachable, onSelect }: { current: WizardStep; reacha
         })}
       </ol>
     </nav>
+  )
+}
+
+/** The Generate button for a re-render: how many of the saved plan's clips it renders. */
+export function rerenderLabel(draft: ClipDraft): string {
+  const run = draft.rerenderFrom
+  if (!run) return 'Generate clips'
+  const count = draft.autoClipCount ? run.clipCount : Math.min(draft.maxClips, run.clipCount)
+  return `Render ${count} clip${count === 1 ? '' : 's'}`
+}
+
+/** Stands in for the Video step while a finished run is re-rendered. */
+export function RerenderNotice({ run, onStartOver }: { run: RerenderSource; onStartOver: () => void }): React.JSX.Element {
+  return (
+    <section aria-labelledby="rerender-heading" className="space-y-3">
+      <div className="glass-tile flex items-start gap-3 rounded-xl px-3 py-3">
+        <IconTile tone="accent" size="sm"><RotateCcw /></IconTile>
+        <div className="min-w-0">
+          <h2 id="rerender-heading" className="text-sm font-semibold text-ink">Render again</h2>
+          <p className="mt-0.5 truncate text-sm text-ink-muted" title={run.title}>{run.title}</p>
+          <p className="mt-1.5 text-xs leading-relaxed text-ink-subtle">
+            Reuses this run's saved transcript and its {run.clipCount} planned clip{run.clipCount === 1 ? '' : 's'}, so it costs no OpenRouter credit.
+            Change the format, captions or banner, then render a few clips to see them. The result is a new run; this one stays as it is.
+          </p>
+        </div>
+      </div>
+      <Button variant="ghost" icon={<ArrowLeft className="h-3.5 w-3.5" />} onClick={onStartOver}>Start over with a new video</Button>
+    </section>
   )
 }
 
@@ -362,10 +429,13 @@ export function FormatStep({ draft, update }: { draft: ClipDraft; update: Update
               )
             })}
           </div>
-          {draft.layoutStyle === 'auto' && draft.clippingMode === 'economy' && (
+          {draft.layoutStyle === 'auto' && draft.rerenderFrom && (
+            <p className="mt-2 text-2xs text-ink-subtle">AI vision checks are off when rendering a run again, so it costs nothing.</p>
+          )}
+          {draft.layoutStyle === 'auto' && !draft.rerenderFrom && draft.clippingMode === 'economy' && (
             <p className="mt-2 text-2xs text-ink-subtle">AI vision checks are off in Economy mode.</p>
           )}
-          {draft.layoutStyle === 'auto' && draft.clippingMode !== 'economy' && (
+          {draft.layoutStyle === 'auto' && !draft.rerenderFrom && draft.clippingMode !== 'economy' && (
             <SettingRow
               className="mt-2"
               title="Check tricky shots with AI vision"
@@ -412,6 +482,22 @@ export function ClipsStep({ draft, update }: { draft: ClipDraft; update: Update 
   const jevEnabled = useSettingsStore((s) => s.jevEnabled === 'on')
   const toggleDuration = (id: string): void => {
     update({ durations: draft.durations.includes(id) ? draft.durations.filter((d) => d !== id) : [...draft.durations, id] })
+  }
+  if (draft.rerenderFrom) {
+    const planned = draft.rerenderFrom.clipCount
+    return (
+      <div className="space-y-4">
+        <ClipCount
+          draft={draft}
+          update={update}
+          max={planned}
+          autoTitle="Render every planned clip"
+          autoDescription={`All ${planned} clip${planned === 1 ? '' : 's'} of the saved plan.`}
+          autoLabel="Render every planned clip"
+          help={`Renders the first ${draft.autoClipCount ? planned : Math.min(draft.maxClips, planned)} clip${(draft.autoClipCount ? planned : Math.min(draft.maxClips, planned)) === 1 ? '' : 's'} of the saved plan.`}
+        />
+      </div>
+    )
   }
   return (
     <div className="space-y-4">
@@ -470,43 +556,60 @@ export function ClipsStep({ draft, update }: { draft: ClipDraft; update: Update 
         {(draft.videoSpeed ?? 1) > 1 && <p className="mt-2 text-2xs text-ink-subtle">Lengths refer to the original footage. At {draft.videoSpeed}×, 60 seconds becomes about {Math.round(60 / draft.videoSpeed)} seconds before dead-air cuts.</p>}
       </Group>
 
-      <Group label="Number of clips">
-        <SettingRow
-          title="Let AI decide"
-          description="Every moment worth posting."
-          control={<Switch label="Let AI decide how many clips" checked={draft.autoClipCount} onChange={(autoClipCount) => update({ autoClipCount })} />}
-        />
-        {!draft.autoClipCount && (
-          <div className="mt-2 flex max-w-xs items-center gap-2 animate-fade-in">
-            <Button
-              iconOnly
-              aria-label="Fewer clips"
-              onClick={() => update({ maxClips: Math.max(1, draft.maxClips - 1) })}
-              disabled={draft.maxClips <= 1}
-              icon={<Minus className="h-3.5 w-3.5" />}
-            />
-            <TextInput
-              className="flex-1 rounded-full [&_input]:text-center"
-              inputMode="numeric"
-              value={String(draft.maxClips)}
-              onChange={(e) => {
-                const n = parseInt(e.target.value.replace(/\D/g, ''), 10)
-                update({ maxClips: Number.isFinite(n) ? Math.min(MAX_CLIPS, Math.max(1, n)) : 1 })
-              }}
-              aria-label="Maximum clips"
-              mono
-            />
-            <Button
-              iconOnly
-              aria-label="More clips"
-              onClick={() => update({ maxClips: Math.min(MAX_CLIPS, draft.maxClips + 1) })}
-              disabled={draft.maxClips >= MAX_CLIPS}
-              icon={<Plus className="h-3.5 w-3.5" />}
-            />
-          </div>
-        )}
-      </Group>
+      <ClipCount draft={draft} update={update} max={MAX_CLIPS} autoTitle="Let AI decide" autoDescription="Every moment worth posting." autoLabel="Let AI decide how many clips" />
     </div>
+  )
+}
+
+/** The "Number of clips" group: a switch for all of them, else a bounded counter. */
+function ClipCount({ draft, update, max, autoTitle, autoDescription, autoLabel, help }: {
+  draft: ClipDraft
+  update: Update
+  max: number
+  autoTitle: string
+  autoDescription: string
+  autoLabel: string
+  help?: string
+}): React.JSX.Element {
+  const count = Math.min(draft.maxClips, max)
+  return (
+    <Group label="Number of clips">
+      <SettingRow
+        title={autoTitle}
+        description={autoDescription}
+        control={<Switch label={autoLabel} checked={draft.autoClipCount} onChange={(autoClipCount) => update({ autoClipCount })} />}
+      />
+      {!draft.autoClipCount && (
+        <div className="mt-2 flex max-w-xs items-center gap-2 animate-fade-in">
+          <Button
+            iconOnly
+            aria-label="Fewer clips"
+            onClick={() => update({ maxClips: Math.max(1, count - 1) })}
+            disabled={count <= 1}
+            icon={<Minus className="h-3.5 w-3.5" />}
+          />
+          <TextInput
+            className="flex-1 rounded-full [&_input]:text-center"
+            inputMode="numeric"
+            value={String(count)}
+            onChange={(e) => {
+              const n = parseInt(e.target.value.replace(/\D/g, ''), 10)
+              update({ maxClips: Number.isFinite(n) ? Math.min(max, Math.max(1, n)) : 1 })
+            }}
+            aria-label="Maximum clips"
+            mono
+          />
+          <Button
+            iconOnly
+            aria-label="More clips"
+            onClick={() => update({ maxClips: Math.min(max, count + 1) })}
+            disabled={count >= max}
+            icon={<Plus className="h-3.5 w-3.5" />}
+          />
+        </div>
+      )}
+      {help && <p className="mt-2 text-2xs text-ink-subtle">{help}</p>}
+    </Group>
   )
 }
 
@@ -536,6 +639,134 @@ export function CaptionsStep({ draft, update }: { draft: ClipDraft; update: Upda
           disabled={!draft.includeCaptions}
         />
       </div>
+      <ChannelBanner draft={draft} update={update} />
+    </div>
+  )
+}
+
+/** One handle for every platform, shown after the icons of the platforms ticked here. Remembered for the next run. */
+function ChannelBanner({ draft, update }: { draft: ClipDraft; update: Update }): React.JSX.Element {
+  const error = bannerHandleError(draft.bannerHandle)
+  const blank = !draft.bannerHandle.trim()
+  const toggle = (id: string): void => {
+    update({ bannerPlatforms: canonicalBannerPlatforms(draft.bannerPlatforms.includes(id) ? draft.bannerPlatforms.filter((p) => p !== id) : [...draft.bannerPlatforms, id]) })
+  }
+  return (
+    <Group label="Channel banner" aside={blank ? 'Off' : 'On every clip'}>
+      <TextInput
+        value={draft.bannerHandle}
+        onChange={(e) => update({ bannerHandle: e.target.value })}
+        placeholder="@YassInPublic"
+        maxLength={BANNER_HANDLE_MAX_CHARS}
+        aria-label="Channel handle"
+        aria-invalid={Boolean(error)}
+        aria-describedby="banner-help"
+      />
+      <p id="banner-help" role={error ? 'alert' : undefined} className={cn('mt-1.5 text-2xs', error ? 'text-danger' : 'text-ink-subtle')}>
+        {error ?? 'Shown on every clip above the platform buttons, with the icons of the platforms you tick. Leave blank for no banner.'}
+      </p>
+      <div className={cn('mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4', blank && 'opacity-50')} role="group" aria-label="Banner platforms">
+        {BANNER_PLATFORMS.map((platform) => {
+          const checked = draft.bannerPlatforms.includes(platform.id)
+          return (
+            <div key={platform.id} className={cn('glass-tile flex items-center gap-2.5 rounded-xl px-3 py-2', !blank && 'glass-tile-hover', checked && !blank && 'glass-selected')}>
+              <Checkbox checked={checked} onChange={() => toggle(platform.id)} disabled={blank} label={platform.label} />
+              <span
+                aria-hidden
+                onClick={() => { if (!blank) toggle(platform.id) }}
+                className={cn('select-none text-sm', blank ? 'cursor-not-allowed text-ink-subtle' : 'cursor-pointer text-ink')}
+              >
+                {platform.label}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+      <div className={cn('mt-3', blank && 'opacity-50')}>
+        <p className="mb-1.5 text-2xs text-ink-subtle">Position</p>
+        <BannerPositionPicker value={draft.bannerPosition ?? 'auto'} onChange={(bannerPosition) => update({ bannerPosition })} disabled={blank} />
+        <p id="banner-position-help" className="mt-1.5 text-2xs text-ink-subtle">
+          {bannerPositionLabel(draft.bannerPosition ?? 'auto')}. Auto takes the lowest clear spot and moves off faces; a grid spot stays where you put it, off the captions. Mixed gives each clip a different spot.
+        </p>
+      </div>
+    </Group>
+  )
+}
+
+const POSITION_CHOICES = [
+  { id: 'auto', label: 'Auto', hint: 'Lowest clear spot' },
+  { id: 'mixed', label: 'Mixed', hint: 'Different per clip' }
+] as const
+/** The mini frame's size (a 9:16 clip) and where its nine dots sit inside it, px. */
+const FRAME_W = 54
+const FRAME_H = 96
+const DOT = 14
+const DOT_X = [6, (FRAME_W - DOT) / 2, FRAME_W - DOT - 6]
+const DOT_Y = [8, (FRAME_H - DOT) / 2, FRAME_H - DOT - 8]
+
+/**
+ * Auto and Mixed tiles beside a 9:16 mini frame with nine dots, one radio
+ * group. All eleven radios are direct children of the group, which the
+ * shared arrow-key handler relies on; the frame outline is only decoration.
+ */
+function BannerPositionPicker({ value, onChange, disabled }: { value: BannerPosition; onChange: (position: BannerPosition) => void; disabled: boolean }): React.JSX.Element {
+  const radio = (id: BannerPosition): { role: 'radio'; 'aria-checked': boolean; tabIndex: number; disabled: boolean; onKeyDown: typeof onRadioKeyDown; onClick: () => void } => ({
+    role: 'radio',
+    'aria-checked': value === id,
+    tabIndex: value === id ? 0 : -1,
+    disabled,
+    onKeyDown: onRadioKeyDown,
+    onClick: () => onChange(id)
+  })
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Banner position"
+      aria-describedby="banner-position-help"
+      className="relative flex items-stretch gap-2"
+      style={{ paddingRight: FRAME_W + 8, minHeight: FRAME_H }}
+    >
+      {POSITION_CHOICES.map((choice) => {
+        const selected = value === choice.id
+        return (
+          <button
+            key={choice.id}
+            type="button"
+            {...radio(choice.id)}
+            className={cn('glass-tile flex-1 rounded-xl px-2 py-1.5 text-center', !disabled && 'glass-tile-hover', selected && !disabled ? 'glass-selected text-ink' : 'text-ink-muted', !disabled && 'hover:text-ink', disabled && 'cursor-not-allowed')}
+          >
+            <span className="block text-xs font-medium">{choice.label}</span>
+            <span className={cn('block truncate text-2xs', selected ? 'text-ink-muted' : 'text-ink-subtle')}>{choice.hint}</span>
+          </button>
+        )
+      })}
+      <span
+        aria-hidden
+        className="glass-well pointer-events-none absolute right-0 top-0 rounded-[6px]"
+        style={{ width: FRAME_W, height: FRAME_H }}
+      />
+      {BANNER_GRID_POSITION_IDS.map((id) => {
+        const [vertical, horizontal] = id.split('-')
+        const row = ['top', 'middle', 'bottom'].indexOf(vertical)
+        const col = ['left', 'center', 'right'].indexOf(horizontal)
+        const selected = value === id
+        return (
+          <button
+            key={id}
+            type="button"
+            aria-label={bannerPositionLabel(id)}
+            title={bannerPositionLabel(id)}
+            {...radio(id)}
+            className={cn(
+              'absolute flex items-center justify-center rounded-full transition-[background,box-shadow] duration-150',
+              selected ? 'bg-accent shadow-[0_0_0_1px_rgb(var(--accent)/0.7)]' : 'bg-white/[0.12] shadow-[inset_0_0_0_1px_rgb(255_255_255/0.18)]',
+              !disabled && !selected && 'hover:bg-white/[0.3]',
+              disabled && 'cursor-not-allowed'
+            )}
+            style={{ width: DOT, height: DOT, right: FRAME_W - DOT_X[col] - DOT, top: DOT_Y[row] }}
+          />
+        )
+      })}
     </div>
   )
 }
@@ -551,13 +782,22 @@ function ReviewStep({ draft, trim, onEdit }: {
     ? 'Any length'
     : DURATIONS.filter((d) => draft.durations.includes(d.id)).map((d) => d.range).join(', ')
   const framing = draft.aspectRatio === '9:16'
-    ? `${LAYOUT_STYLES.find((s) => s.id === draft.layoutStyle)?.label ?? 'Smart'} framing${draft.clippingMode !== 'economy' && draft.layoutStyle === 'auto' && draft.layoutVision ? ' · AI vision' : ''}`
+    ? `${LAYOUT_STYLES.find((s) => s.id === draft.layoutStyle)?.label ?? 'Smart'} framing${!draft.rerenderFrom && draft.clippingMode !== 'economy' && draft.layoutStyle === 'auto' && draft.layoutVision ? ' · AI vision' : ''}`
     : 'Whole frame'
   const trimLabel = draft.trimOpen && (trim.start != null || trim.end != null)
     ? ` · ${trim.start != null ? formatSeconds(trim.start) : 'start'} to ${trim.end != null ? formatSeconds(trim.end) : 'end'}`
     : ''
 
-  const rows: { step: WizardStep; label: string; value: string }[] = [
+  const rerender = draft.rerenderFrom
+  const planned = rerender?.clipCount ?? 0
+  const rows: { step: WizardStep; label: string; value: string }[] = rerender ? [
+    { step: 'video', label: 'Render again', value: rerender.title },
+    { step: 'format', label: 'Format', value: `${FORMATS.find((f) => f.id === draft.aspectRatio)?.label ?? draft.aspectRatio} ${draft.aspectRatio} · ${framing}` },
+    { step: 'format', label: 'Pacing', value: draft.pacing === 'tight' ? 'Cut dead air' : 'Keep pauses' },
+    { step: 'format', label: 'Speed', value: `${draft.videoSpeed ?? 1}×${(draft.videoSpeed ?? 1) === 1 ? ' · Normal' : ' · All exported clips'}` },
+    { step: 'clips', label: 'Clips', value: draft.autoClipCount ? `All ${planned} planned clip${planned === 1 ? '' : 's'}` : `First ${Math.min(draft.maxClips, planned)} of ${planned} planned clip${planned === 1 ? '' : 's'}` },
+    { step: 'captions', label: 'Captions', value: draft.includeCaptions ? CAPTION_PRESET_NAMES[draft.captionPreset] ?? draft.captionPreset : 'Off' }
+  ] : [
     { step: 'video', label: 'Workflow', value: draft.workflow === 'review' ? 'Review & edit · export when ready' : 'Automatic' },
     { step: 'video', label: 'Video', value: `${sourceLabel(draft.source)}${trimLabel}` },
     { step: 'format', label: 'Format', value: `${FORMATS.find((f) => f.id === draft.aspectRatio)?.label ?? draft.aspectRatio} ${draft.aspectRatio} · ${framing}` },
@@ -569,7 +809,12 @@ function ReviewStep({ draft, trim, onEdit }: {
     { step: 'captions', label: 'Captions', value: draft.includeCaptions ? CAPTION_PRESET_NAMES[draft.captionPreset] ?? draft.captionPreset : 'Off' }
   ]
   if (draft.workflow !== 'review') rows.push({ step: 'captions', label: 'Title', value: draft.includeTitle ? 'Shown at the top' : 'Off' })
-  if (draft.clippingMode === 'advanced') rows.splice(5, 0,
+  const bannerHandle = normalizeBannerHandle(draft.bannerHandle)
+  const bannerLabels = BANNER_PLATFORMS.filter((p) => draft.bannerPlatforms.includes(p.id)).map((p) => p.label)
+  const position = draft.bannerPosition ?? 'auto'
+  const positionSuffix = position !== 'auto' ? ` · ${bannerPositionLabel(position)}` : ''
+  rows.push({ step: 'captions', label: 'Banner', value: bannerHandle ? `${bannerLabels.length ? `${bannerHandle} · ${bannerLabels.join(', ')}` : bannerHandle}${positionSuffix}` : 'Off' })
+  if (draft.clippingMode === 'advanced' && !rerender) rows.splice(5, 0,
     { step: 'clips', label: 'Transcribe', value: draft.transcriptionModel || 'Choose a model' },
     { step: 'clips', label: 'Plan', value: draft.plannerModel || 'Choose a model' })
 

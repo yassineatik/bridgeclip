@@ -51,7 +51,11 @@ from clip_engine.services.layout_renderer import (
     banner_y,
     build_layout_graph,
     caption_anchor,
+    banner_obstacles,
+    banner_x_expr,
+    parse_banner_position,
     face_zones,
+    faces_during,
     measured_loudness_filter,
     per_shot_expr,
     title_y,
@@ -60,6 +64,21 @@ from clip_engine.services.transcription_service import TranscriptSegment
 from clip_engine.services.video_speed import scaled_duration_ms, speed_video_filter, validate_video_speed
 
 logger = logging.getLogger(__name__)
+
+
+def banner_icon_path(platform: str) -> Optional[str]:
+    """The bundled white icon for a banner platform, or None when missing."""
+    if platform not in BANNER_PLATFORMS:
+        return None
+    for base in (
+        os.path.join(os.path.dirname(__file__), "..", "..", "assets", "icons"),
+        os.path.join("/app", "assets", "icons"),
+    ):
+        path = os.path.abspath(os.path.join(base, f"{platform}.png"))
+        if os.path.isfile(path):
+            return path
+    return None
+
 
 # (png_path, x_expr, y_expr) for an image composited over the video, or
 # (png_path, x_expr, y_expr, enable_expr, image_filter) for one shown only
@@ -74,6 +93,11 @@ LANDSCAPE_TITLE_FADE_S = 0.4
 MAX_OUTPUT_FPS = 60
 # Bound raster allocation even when a model ignores the requested title length.
 MAX_TITLE_CHARS = 120
+# Platforms with a bundled banner icon (assets/icons/<platform>.png), in the
+# order the icons are drawn. Unknown platforms are skipped, never fatal.
+BANNER_PLATFORMS = ("youtube", "x", "tiktok", "instagram")
+# Longest channel handle drawn on the banner, whatever the request says.
+MAX_BANNER_CHARS = 64
 # Landscape H.264 bitrates (Mbps) by output height at 30 fps, after
 # YouTube's upload recommendations; 60 fps sources get 1.5x.
 LANDSCAPE_BITRATE_MBPS = {1080: 12, 1440: 20, 2160: 45}
@@ -109,8 +133,13 @@ class RenderRequest:
     # Planner-chosen punch words highlighted in the captions.
     emphasis_words: list[str] = field(default_factory=list)
 
-    banner_platform: Optional[str] = None
-    banner_channel_url: Optional[str] = None
+    # Channel banner: the creator's handle (drawn as typed) after the icons of
+    # the platforms it belongs to. No handle, no banner.
+    banner_handle: Optional[str] = None
+    banner_platforms: list[str] = field(default_factory=list)
+    # Where it sits: "auto" or "<top|middle|bottom>-<left|center|right>"
+    # (layout_renderer.banner_y). "mixed" is resolved per clip by the pipeline.
+    banner_position: str = "auto"
 
     include_audio: bool = True
     apply_padding: bool = True
@@ -557,11 +586,17 @@ class RenderingService:
             video_speed=request.video_speed,
         )
         out_plan = remap_plan(plan, time_map)
+        # Faces on the output frame steer both the captions and the banner (9:16).
+        zones = [] if is_landscape else face_zones(plan, time_map, target_width, target_height)
+        faces_by_shot = [faces_during(zones, s.start_ms, s.end_ms) for s in out_plan.shots]
+        # The banner is drawn first: moved captions keep above it.
+        banner = self._banner_overlay_image(request, self._banner_font_size(target_height, is_landscape))
         caption_path = await self._generate_captions(
             request, target_width, target_height, window_start_ms, time_map, out_plan, is_landscape, plan,
+            banner=banner if not is_landscape else None, zones=zones, faces_by_shot=faces_by_shot,
         )
         graph += self._caption_graph(caption_path, request.caption_suppression_ranges_ms, window_start_ms, time_map)
-        overlays = self._overlays(request, out_plan, target_width, target_height, is_landscape)
+        overlays = self._overlays(request, out_plan, target_width, target_height, is_landscape, banner, faces_by_shot)
         # Burn captions and animate framing/overlays on the edited source clock,
         # then speed up the entire composited picture to match the tempo audio.
         filter_complex, extra_inputs = self._compose_overlays(
@@ -663,8 +698,16 @@ class RenderingService:
         target_width: int,
         target_height: int,
         is_landscape: bool,
+        banner: Optional[tuple[str, int, int]] = None,
+        faces_by_shot: Optional[list[list[tuple[int, int, int, int]]]] = None,
     ) -> list[Overlay]:
-        """Title card and channel banner, positioned per shot on the output timeline."""
+        """Title card and channel banner, positioned per shot on the output timeline.
+
+        `banner` is the (path, width, height) from _banner_overlay_image when
+        the caller already drew it; otherwise it is drawn here. `faces_by_shot`
+        lists the face rects seen during each shot of `out_plan`, which the
+        banner keeps off.
+        """
         src_w, src_h = out_plan.source_width, out_plan.source_height
         overlays: list[Overlay] = []
         # Landscape overlays were sized for 1080p; scale them with the output.
@@ -685,15 +728,32 @@ class RenderingService:
                 overlays.append((path, "(W-w)/2", per_shot_expr(out_plan, [
                     title_y(s, src_w, src_h, target_width, target_height, height) for s in out_plan.shots
                 ])))
-        banner = self._banner_overlay_image(request, round(28 * scale) if is_landscape else 34)
+        banner = banner or self._banner_overlay_image(request, self._banner_font_size(target_height, is_landscape))
         if banner:
+            vertical, horizontal = parse_banner_position(request.banner_position)
             if is_landscape:
-                overlays.append((banner[0], f"W-w-{round(20 * scale)}", f"H-h-{round(16 * scale)}"))
+                # Corners by default (bottom right), or wherever the position says.
+                margin_x, margin_y = round(20 * scale), round(16 * scale)
+                if vertical == "auto":
+                    horizontal = "right"
+                x = {"left": f"{margin_x}", "center": "(W-w)/2"}.get(horizontal, f"W-w-{margin_x}")
+                y = {"top": f"{round(20 * scale)}", "middle": "(H-h)/2"}.get(vertical, f"H-h-{margin_y}")
+                overlays.append((banner[0], x, y))
             else:
-                overlays.append((banner[0], "(W-w)/2", per_shot_expr(out_plan, [
-                    banner_y(s, src_w, src_h, target_width, target_height) for s in out_plan.shots
+                captioned = bool(request.include_captions and request.transcript_segments)
+                faces = faces_by_shot or [[] for _ in out_plan.shots]
+                overlays.append((banner[0], banner_x_expr(horizontal, target_width), per_shot_expr(out_plan, [
+                    banner_y(s, src_w, src_h, target_width, target_height, banner[2], avoid_captions=captioned,
+                             faces=shot_faces, banner_w=banner[1], position=request.banner_position,
+                             title_shown=bool(title))
+                    for s, shot_faces in zip(out_plan.shots, faces)
                 ])))
         return overlays
+
+    @staticmethod
+    def _banner_font_size(target_height: int, is_landscape: bool) -> int:
+        """Landscape banners were sized for 1080p and scale with the output."""
+        return round(28 * target_height / 1080) if is_landscape else 34
 
     def _caption_graph(
         self, caption_path: Optional[str], suppressed: list[tuple[int, int]],
@@ -790,11 +850,16 @@ class RenderingService:
         out_plan: ClipLayoutPlan,
         is_landscape: bool,
         plan: Optional[ClipLayoutPlan] = None,
+        banner: Optional[tuple[str, int, int]] = None,
+        zones=None,
+        faces_by_shot: Optional[list[list[tuple[int, int, int, int]]]] = None,
     ) -> Optional[str]:
         """ASS captions on the edited timeline, positioned per shot (9:16).
 
         With the window-time `plan`, each caption group also moves off any
-        face it would cover (see CaptionPlacer).
+        face it would cover (see CaptionPlacer), staying above the channel
+        `banner` (path, width, height) when one is shown. `zones` and
+        `faces_by_shot` are the frame's faces when the caller has them.
         """
         if not (request.include_captions and request.transcript_segments):
             return None
@@ -817,9 +882,17 @@ class RenderingService:
                 raise ValueError('Invalid caption position')
             anchors = [(10**9, 5, round(target_height * request.caption_y))]
         elif anchors and plan is not None:
-            zones = face_zones(plan, time_map, target_width, target_height)
+            if zones is None:
+                zones = face_zones(plan, time_map, target_width, target_height)
             if zones:
-                placer = CaptionPlacer(anchors, zones, target_width, target_height)
+                obstacles = None
+                if banner:
+                    obstacles = banner_obstacles(
+                        out_plan, out_plan.source_width, out_plan.source_height, target_width, target_height,
+                        banner[2], faces_by_shot, banner[1], position=request.banner_position,
+                        title_shown=bool(request.include_title and (request.title_text or "").strip()),
+                    )
+                placer = CaptionPlacer(anchors, zones, target_width, target_height, obstacles=obstacles)
 
         caption_path = os.path.join(
             os.path.dirname(request.output_path),
@@ -1020,17 +1093,19 @@ class RenderingService:
         return {"y": card_y, "width": img_w, "height": img_h}
 
     def _banner_overlay_image(self, request: RenderRequest, font_size: int) -> Optional[tuple[str, int, int]]:
-        """Render the channel URL banner as a transparent PNG.
+        """Render the channel banner as a transparent PNG: the chosen platform
+        icons, then the handle in white, each with a soft shadow.
 
         Drawn with Pillow rather than FFmpeg's drawtext: the static FFmpeg
         builds BridgeClip ships (6.1+) omit drawtext, which made any render with
-        a banner fail.
+        a banner fail. The handle is drawn as typed; handles are case-sensitive
+        to the eye (@YassInPublic), so it is never uppercased.
 
-        Returns (path, width, height) or None when no banner is configured.
+        Returns (path, width, height) or None when no handle is configured.
         """
-        if not (request.banner_platform and request.banner_channel_url):
+        handle = (request.banner_handle or "").strip()[:MAX_BANNER_CHARS]
+        if not handle:
             return None
-        text = request.banner_channel_url.upper().strip()
         path = os.path.join(
             os.path.dirname(request.output_path),
             f"banner-{request.start_time_ms}-{request.end_time_ms}.png",
@@ -1039,15 +1114,46 @@ class RenderingService:
             font = ImageFont.truetype(self._font_path, font_size)
         except Exception:
             font = ImageFont.load_default()
-        bbox = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox((0, 0), text, font=font)
-        shadow = 2
-        width = bbox[2] - bbox[0] + shadow + 4
-        height = bbox[3] - bbox[1] + shadow + 4
+        shadow, pad = 2, 2
+        icon_size = round(font_size * 1.15)
+        icon_gap = round(font_size * 0.3)
+        text_gap = round(font_size * 0.45)
+
+        icons: list[Image.Image] = []
+        for platform in BANNER_PLATFORMS:
+            if platform not in request.banner_platforms:
+                continue
+            icon_path = banner_icon_path(platform)
+            if icon_path is None:
+                logger.warning(f"No banner icon for {platform}; drawing the banner without it")
+                continue
+            with Image.open(icon_path) as icon:
+                icons.append(icon.convert("RGBA").resize((icon_size, icon_size), Image.LANCZOS))
+
+        bbox = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox((0, 0), handle, font=font)
+        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        icons_w = len(icons) * icon_size + max(0, len(icons) - 1) * icon_gap
+        content_w = icons_w + (text_gap if icons else 0) + text_w
+        content_h = max(text_h, icon_size if icons else 0)
+        width = content_w + shadow + 2 * pad
+        height = content_h + shadow + 2 * pad
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        origin = (2 - bbox[0], 2 - bbox[1])
-        draw.text((origin[0] + shadow, origin[1] + shadow), text, font=font, fill=(0, 0, 0, 128))
-        draw.text(origin, text, font=font, fill=(255, 255, 255, 255))
+
+        x = pad
+        for icon in icons:
+            y = pad + (content_h - icon_size) // 2
+            # The icon's own shape in half-transparent black, offset like the text shadow.
+            shade = Image.new("RGBA", icon.size, (0, 0, 0, 0))
+            shade.putalpha(icon.getchannel("A").point(lambda a: a // 2))
+            image.alpha_composite(shade, (x + shadow, y + shadow))
+            image.alpha_composite(icon, (x, y))
+            x += icon_size + icon_gap
+        if icons:
+            x += text_gap - icon_gap
+        origin = (x - bbox[0], pad + (content_h - text_h) // 2 - bbox[1])
+        draw.text((origin[0] + shadow, origin[1] + shadow), handle, font=font, fill=(0, 0, 0, 128))
+        draw.text(origin, handle, font=font, fill=(255, 255, 255, 255))
         image.save(path, "PNG")
         return path, width, height
 

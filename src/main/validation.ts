@@ -2,7 +2,7 @@ import { normalizeVideoSource, twitchSourceError } from '../shared/video-source'
 import { isAbsolute } from 'path'
 import type { ClipJobConfig } from './pipeline-runner'
 import { isWebUrl } from './security'
-import { CLIP_REQUEST_MAX_CHARS, DURATION_IDS, isVideoSpeed } from '../shared/job-contract'
+import { BANNER_PLATFORM_IDS, CLIP_REQUEST_MAX_CHARS, DURATION_IDS, canonicalBannerPlatforms, isBannerHandle, isBannerPosition, isVideoSpeed, normalizeBannerHandle, normalizeBannerPosition } from '../shared/job-contract'
 import { isModelId } from '../shared/openrouter-models'
 import type { ClipJobRequest } from '../shared/jobs'
 
@@ -37,17 +37,33 @@ export function validateJobConfig(value: unknown): ClipJobConfig {
     if (time !== null && (typeof time !== 'number' || !Number.isFinite(time) || time < 0)) throw new Error('Invalid trim time')
   }
   if (v.endTimeSeconds !== null && v.endTimeSeconds <= (v.startTimeSeconds ?? 0)) throw new Error('Trim end must follow trim start')
-  if (v.bannerPlatform !== null && (typeof v.bannerPlatform !== 'string' || !/^[a-z0-9_-]{1,64}$/i.test(v.bannerPlatform))) throw new Error('Invalid banner platform')
-  if (v.bannerChannelUrl !== null && (!isWebUrl(v.bannerChannelUrl) || v.bannerChannelUrl.length > 8192)) throw new Error('Invalid banner URL')
+  // Requests stored before the banner had a handle carry neither field.
+  const rawHandle = v.bannerHandle ?? null
+  const rawPlatforms = v.bannerPlatforms === undefined ? [] : v.bannerPlatforms
+  if (rawHandle !== null && (typeof rawHandle !== 'string' || !isBannerHandle(rawHandle))) throw new Error('Use letters, numbers, dots, underscores or dashes in the handle')
+  if (!Array.isArray(rawPlatforms) || rawPlatforms.some((platform) => !BANNER_PLATFORM_IDS.includes(platform)) || new Set(rawPlatforms).size !== rawPlatforms.length) throw new Error('Invalid banner platforms')
+  const bannerHandle = rawHandle === null ? null : normalizeBannerHandle(rawHandle)
+  const bannerPlatforms = bannerHandle ? canonicalBannerPlatforms(rawPlatforms) : []
+  if (v.bannerPosition !== undefined && !isBannerPosition(v.bannerPosition)) throw new Error('Invalid banner position')
+  const bannerPosition = bannerHandle ? normalizeBannerPosition(v.bannerPosition ?? 'auto') : v.bannerPosition === undefined ? undefined : normalizeBannerPosition(v.bannerPosition)
+  if (v.rerenderFrom !== undefined && (typeof v.rerenderFrom !== 'string' || !RUN_ID.test(v.rerenderFrom))) throw new Error('Invalid run to render again')
+  if (v.rerenderFrom !== undefined && v.workflow !== undefined && v.workflow !== 'automatic') throw new Error('Render again only works with the Automatic workflow')
+  // A re-render reuses the run's saved plan: nothing that steers planning or vision applies.
+  const rerender: Partial<ClipJobConfig> = v.rerenderFrom === undefined ? {} : {
+    workflow: 'automatic', clipRequest: undefined, durationRanges: null, startTimeSeconds: null, endTimeSeconds: null, layoutVision: false
+  }
   // Capabilities are looked up in main after validation, never accepted from the renderer.
   const clipRequest = v.clipRequest === undefined ? undefined : trimClipRequest(v.clipRequest) || undefined
   // Only known fields continue: a misspelled option must not ride along in the job record.
   const known = Object.fromEntries(JOB_REQUEST_FIELDS.filter((key) => v[key] !== undefined).map((key) => [key, v[key]])) as unknown as ClipJobConfig
-  return { ...known, videoUrl: normalizeVideoSource(v.videoUrl), videoSpeed: v.videoSpeed ?? 1, includeTitle: v.includeTitle ?? true, clipRequest, plannerCapabilities: undefined }
+  return { ...known, videoUrl: normalizeVideoSource(v.videoUrl), videoSpeed: v.videoSpeed ?? 1, includeTitle: v.includeTitle ?? true, clipRequest, bannerHandle, bannerPlatforms, bannerPosition, ...rerender, plannerCapabilities: undefined }
 }
+
+/** A run's output folder name; no separators, so it can never leave the output directory. */
+const RUN_ID = /^[A-Za-z0-9_-]{1,128}$/
 
 const JOB_REQUEST_FIELDS: readonly (keyof ClipJobRequest)[] = [
   'workflow', 'videoUrl', 'clippingMode', 'plannerModel', 'transcriptionModel', 'clipRequest', 'maxClips', 'autoClipCount',
   'durationRanges', 'aspectRatio', 'layoutStyle', 'layoutVision', 'pacing', 'videoSpeed', 'includeCaptions', 'captionPreset',
-  'includeTitle', 'startTimeSeconds', 'endTimeSeconds', 'bannerPlatform', 'bannerChannelUrl'
+  'includeTitle', 'startTimeSeconds', 'endTimeSeconds', 'bannerHandle', 'bannerPlatforms', 'bannerPosition', 'rerenderFrom'
 ]

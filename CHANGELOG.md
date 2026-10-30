@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Mai
 
 - **What to clip** in Create → Clips: describe the moments you want, such as "every time they talk about pricing". Leave it blank to get the strongest moments as before.
 - **Show title at the top** in Create → Captions turns off the title card on Automatic clips.
+- **Render again** on a finished run in the Library: re-render the first few planned clips with new format, caption or banner settings, reusing the saved transcript and plan, so trying a change costs no OpenRouter credit. Each re-render is a new run.
+- **Channel banner** in Create → Captions: your handle, with the icons of the platforms you choose, on every clip. It stays above the Shorts/TikTok/Reels buttons and off the captions, and is remembered for your next run. Choose where it sits with a 3×3 grid, Auto, or Mixed for a different spot on each clip.
 - **Review & edit** workflow: look over clip candidates before exporting. Trim, split and extend cuts, change layouts and camera changes, fix and place captions, then bake one clip or every ready clip with **Bake all**. You can also swap in a higher-quality copy of the source video.
 - Jobs show progress for each stage on a timeline, a **Job Breakdown** of where the time went, and **Details** with reviews, the transcript and source research.
 - The Library shows how many clips in each run are posted, lets you bookmark runs, and deletes whole runs or single clips.

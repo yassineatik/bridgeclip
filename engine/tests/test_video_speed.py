@@ -71,7 +71,7 @@ def test_real_exports_preserve_sync_and_pitch_after_seek_and_cuts(tmp_path, medi
         str(path), str(tmp_path / "clip.mp4"), 1137, 13137, 64, 64,
         video_speed=speed, pacing="natural", aspect_ratio="16:9", apply_padding=False,
         include_captions=False, skip_ranges_ms=[(3137, 4137)],
-        title_text="Faster clips", banner_platform="youtube", banner_channel_url="example.com",
+        title_text="Faster clips", banner_handle="@example", banner_platforms=["youtube"],
     )
     result = asyncio.run(media_service.render_clip(request))
     assert result.render_fallback is None

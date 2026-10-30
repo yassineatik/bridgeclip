@@ -14,4 +14,4 @@ The [MIT license](LICENSE) covers BridgeClip-owned clipping engine source. The f
 
 Python dependencies are pinned with hashes in `requirements.lock`. Their individual licenses are determined by the package distributions and are not replaced by the BridgeClip MIT license. The desktop release also includes Python, yt-dlp, FFmpeg and their notices; see the root `THIRD_PARTY_NOTICES.md` and `docs/RELEASING.md`.
 
-No third-party platform logos are bundled. Names and trademarks remain with their owners. Before a public binary release, review the actual built package, dependency license inventory and ownership of original source and artwork.
+No third-party platform logos are bundled: the channel-banner icons in `assets/icons/` are simplified original drawings made by `scripts/banner-icons.py`, and they only identify the platform a handle belongs to. Names and trademarks remain with their owners. Before a public binary release, review the actual built package, dependency license inventory and ownership of original source and artwork.

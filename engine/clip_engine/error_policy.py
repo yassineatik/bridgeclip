@@ -14,6 +14,7 @@ DISK_FULL_MARKERS = ("no space left on device", "disk quota exceeded")
 
 NO_CLIP_CANDIDATES_MESSAGE = 'The planner returned no clip candidates'
 NO_REQUESTED_MOMENTS_MESSAGE = 'No moments matched the clip request'
+RERENDER_SOURCE_MESSAGE = 'This run has no saved transcript and plan to render again'
 
 
 class NoClipCandidatesError(Exception):
@@ -22,6 +23,10 @@ class NoClipCandidatesError(Exception):
 
 class NoRequestedMomentsError(NoClipCandidatesError):
     """The user described what to clip and the planner found nothing that matched."""
+
+
+class RerenderSourceError(Exception):
+    """Render again was asked of a run without a usable transcript.json and plan.json."""
 
 
 def is_disk_full(error: BaseException) -> bool:
@@ -52,6 +57,8 @@ def safe_processing_error(error: Exception) -> str:
         return NO_REQUESTED_MOMENTS_MESSAGE
     if isinstance(error, NoClipCandidatesError):
         return NO_CLIP_CANDIDATES_MESSAGE
+    if isinstance(error, RerenderSourceError):
+        return RERENDER_SOURCE_MESSAGE
     if type(error).__name__ == "VisualPlanningUnsupportedError":
         return "Selected planner requires a video with speech"
     if type(error).__name__ == "VideoDownloadError":
@@ -93,6 +100,8 @@ def safe_failure_code(error: Exception) -> str:
         return "storage.full"
     if isinstance(error, NoClipCandidatesError):
         return 'planning.no_candidates'
+    if isinstance(error, RerenderSourceError):
+        return 'rerender.missing_sources'
     if type(error).__name__ == "VisualPlanningUnsupportedError":
         return "planning.images_unsupported"
     if type(error).__name__ in {"TranscriptionError", "TranscriptionProviderError"}:
@@ -118,7 +127,7 @@ def safe_job_error_text(error: str | None) -> str | None:
     """Only expose known, fixed messages from stored job state."""
     if error is None:
         return None
-    if error in (NO_CLIP_CANDIDATES_MESSAGE, NO_REQUESTED_MOMENTS_MESSAGE):
+    if error in (NO_CLIP_CANDIDATES_MESSAGE, NO_REQUESTED_MOMENTS_MESSAGE, RERENDER_SOURCE_MESSAGE):
         return error
     if error in TWITCH_ERRORS.values():
         return error
